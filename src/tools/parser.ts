@@ -44,6 +44,8 @@ interface ActiveIncrementalToolCall {
 // ─── XML Helpers ───────────────────────────────────────────────────────────────
 
 const TOOL_END = "</" + "tool_call>";
+const TOOL_CALLING_START = "<tool_calling>";
+const TOOL_CALLING_END = "</tool_calling>";
 
 function normalizeToolNameForMatch(name: string): string {
   return name.toLowerCase().replace(/[^a-z0-9]/g, "");
@@ -132,7 +134,7 @@ function findNextToolOpenTagOutsideMarkdownCode(
       const match = buffer
         .substring(i)
         .match(
-          /^<tool_call(?:\b[^>\r\n]*|[_~!:-][^>\r\n]*)(?:>|\r?\n)/i,
+          /^(?:<tool_calling>|<tool_call(?:\b[^>\r\n]*|[_~!:-][^>\r\n]*)(?:>|\r?\n))/i,
         );
       if (match) {
         return { index: i, openTag: match[0] };
@@ -146,6 +148,9 @@ function findNextToolOpenTagOutsideMarkdownCode(
 }
 
 function getToolCloseTag(openTag: string): string {
+  if (openTag.toLowerCase() === TOOL_CALLING_START) {
+    return TOOL_CALLING_END;
+  }
   const namedMatch = openTag.match(/^<tool_call_([a-z0-9_-]+)>$/i);
   return namedMatch ? `</tool_call_${namedMatch[1]}>` : TOOL_END;
 }
@@ -174,6 +179,7 @@ function findPartialToolOpenIndexOutsideMarkdownCode(
 ): number {
   let delimiterLength = initialDelimiterLength;
   const lowerToolStart = TOOL_START_LITERAL.toLowerCase();
+  const lowerToolCallingStart = TOOL_CALLING_START.toLowerCase();
 
   for (let i = 0; i < buffer.length;) {
     if (buffer[i] === "`") {
@@ -203,6 +209,9 @@ function findPartialToolOpenIndexOutsideMarkdownCode(
         return i;
       }
       if (lowerToolStart.startsWith(tailLower)) {
+        return i;
+      }
+      if (lowerToolCallingStart.startsWith(tailLower)) {
         return i;
       }
     }
@@ -736,6 +745,7 @@ export class StreamingToolParser {
   private insideTool = false;
   private currentOpenTag = TOOL_START_LITERAL;
   private emittedToolCallCount = 0;
+  private emittedToolCallSignatures = new Set<string>();
   private pendingLeadIn = "";
   private tools: ToolDefinitionLike[] = [];
   private declaredToolNames: string[] = [];
@@ -897,6 +907,20 @@ export class StreamingToolParser {
     if (incremental && incremental.name === tc.name) {
       tc.id = incremental.id;
     }
+
+    const signature = JSON.stringify([tc.name, tc.arguments]);
+    if (this.emittedToolCallSignatures.has(signature)) {
+      logger.warn("[parser] Dropping duplicate tool call in the same completion", {
+        toolName: tc.name,
+      });
+      this.pendingLeadIn = "";
+      if (incremental) {
+        incremental.startEmitted = false;
+        incremental.disabled = true;
+      }
+      return;
+    }
+    this.emittedToolCallSignatures.add(signature);
 
     if (matchesIncrementalCall) {
       this.emittedToolCallCount++;

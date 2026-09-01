@@ -129,6 +129,18 @@ test("StreamingToolParser: multiple tool calls", () => {
   assert.strictEqual(result.toolCalls[1].name, "t3");
 });
 
+test("StreamingToolParser: recovers tool_calling and deduplicates identical calls", () => {
+  const parser = new StreamingToolParser(TOOLS);
+  const block =
+    '<tool_calling>{"name":"read_file","arguments":{"path":"a.txt"}}</tool_calling>';
+  const result = parser.feed(`${block}\nI should call it now.\n${block}`);
+
+  assert.strictEqual(result.text, "");
+  assert.strictEqual(result.toolCalls.length, 1);
+  assert.strictEqual(result.toolCalls[0].name, "read_file");
+  assert.deepStrictEqual(result.toolCalls[0].arguments, { path: "a.txt" });
+});
+
 test("StreamingToolParser: fragmented tool call", () => {
   const parser = new StreamingToolParser();
 

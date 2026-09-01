@@ -542,6 +542,51 @@ test("stream: write_file arguments are emitted once after tool close", async () 
   }
 });
 
+test("stream: repeated tool_calling wrappers emit one structured call", async () => {
+  const block =
+    '<tool_calling>{"name":"read_file","arguments":{"path":"a.txt"}}</tool_calling>';
+  const restore = setupFetchMock(() =>
+    createSseResponse([
+      `data: ${JSON.stringify({
+        choices: [
+          {
+            delta: {
+              phase: "answer",
+              content: `${block}\nI should call it now.\n${block}`,
+            },
+          },
+        ],
+      })}`,
+    ]),
+  );
+
+  try {
+    const req = new Request("http://localhost/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "qwen3.6-plus",
+        stream: true,
+        tools: TOOLS,
+        messages: [{ role: "user", content: "read a file" }],
+      }),
+    });
+
+    const res = await app.fetch(req);
+    assert.strictEqual(res.status, 200);
+    const result = await collectStreamResult(res);
+    assert.strictEqual(result.content, "");
+    assert.strictEqual(result.toolCalls.length, 1);
+    assert.strictEqual(result.toolCalls[0].name, "read_file");
+    assert.deepStrictEqual(JSON.parse(result.toolCalls[0].arguments), {
+      path: "a.txt",
+    });
+    assert.strictEqual(result.finishReason, "tool_calls");
+  } finally {
+    restore();
+  }
+});
+
 test("non-stream: missing opening tag is recovered when closing tag is present", async () => {
   const restore = setupFetchMock(() =>
     createSseResponse([
