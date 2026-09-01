@@ -134,7 +134,7 @@ function findNextToolOpenTagOutsideMarkdownCode(
       const match = buffer
         .substring(i)
         .match(
-          /^(?:<tool_calling>|<tool_call(?:\b[^>\r\n]*|[_~!:-][^>\r\n]*)(?:>|\r?\n))/i,
+          /^(?:<tool_calling>|<tool_call(?:[ \t]+[^>\r\n]*|[-_~!:][^>\r\n]*)?(?:>|\r?\n))/i,
         );
       if (match) {
         return { index: i, openTag: match[0] };
@@ -166,7 +166,7 @@ function findToolCloseTag(
   }
 
   const malformedMatch = buffer.match(
-    /<\/tool_call(?:\b[^>\r\n]*|[_~!:-][^>\r\n]*)(?:>|\r?\n)/i,
+    /<\/tool_call(?:[ \t]+[^>\r\n]*|[-_~!:][^>\r\n]*)?(?:>|\r?\n)/i,
   );
   return malformedMatch?.index === undefined
     ? null

@@ -587,6 +587,39 @@ test("stream: repeated tool_calling wrappers emit one structured call", async ()
   }
 });
 
+test("stream: ellipsis placeholder stays text and does not force length", async () => {
+  const content = "<tool_call...>\nCODEX_FINAL_TOOL_OK";
+  const restore = setupFetchMock(() =>
+    createSseResponse([
+      `data: ${JSON.stringify({
+        choices: [{ delta: { phase: "answer", content } }],
+      })}`,
+    ]),
+  );
+
+  try {
+    const req = new Request("http://localhost/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "qwen3.6-plus",
+        stream: true,
+        tools: TOOLS,
+        messages: [{ role: "user", content: "read a file" }],
+      }),
+    });
+
+    const res = await app.fetch(req);
+    assert.strictEqual(res.status, 200);
+    const result = await collectStreamResult(res);
+    assert.strictEqual(result.content, content);
+    assert.strictEqual(result.toolCalls.length, 0);
+    assert.strictEqual(result.finishReason, "stop");
+  } finally {
+    restore();
+  }
+});
+
 test("non-stream: missing opening tag is recovered when closing tag is present", async () => {
   const restore = setupFetchMock(() =>
     createSseResponse([

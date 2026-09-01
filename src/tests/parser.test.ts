@@ -141,6 +141,21 @@ test("StreamingToolParser: recovers tool_calling and deduplicates identical call
   assert.deepStrictEqual(result.toolCalls[0].arguments, { path: "a.txt" });
 });
 
+test("StreamingToolParser: preserves ellipsis placeholders as ordinary text", () => {
+  const parser = new StreamingToolParser(TOOLS);
+  const first = parser.feed("<tool_call");
+  const second = parser.feed("...>\nCODEX_");
+  const third = parser.feed("FINAL_TOOL_OK");
+  const flushed = parser.flush();
+
+  assert.strictEqual(
+    first.text + second.text + third.text + flushed.text,
+    "<tool_call...>\nCODEX_FINAL_TOOL_OK",
+  );
+  assert.strictEqual(flushed.toolCalls.length, 0);
+  assert.strictEqual(flushed.truncatedToolCall, false);
+});
+
 test("StreamingToolParser: fragmented tool call", () => {
   const parser = new StreamingToolParser();
 
