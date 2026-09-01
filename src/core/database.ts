@@ -1,13 +1,28 @@
 import Database from "better-sqlite3";
 import path from "path";
 import fs from "fs";
+import os from "os";
 import { encrypt, isEncrypted } from "./crypto-utils.ts";
 
 const DATA_DIR = path.resolve("data");
-const DB_DIR = path.join(DATA_DIR, "db");
-const DB_PATH = path.join(DB_DIR, "qwenbridge.db");
+const DEFAULT_DB_DIR = path.join(DATA_DIR, "db");
+const DEFAULT_DB_PATH = path.join(DEFAULT_DB_DIR, "qwenbridge.db");
+const isNodeTestProcess =
+  process.env.NODE_TEST_CONTEXT !== undefined ||
+  process.argv.some((arg) => /(?:^|[\\/])[^\\/]+\.test\.[cm]?[jt]s$/.test(arg));
+const configuredDbPath = process.env.QWENBRIDGE_DB_PATH;
+const DB_PATH = configuredDbPath
+  ? configuredDbPath === ":memory:"
+    ? configuredDbPath
+    : path.resolve(configuredDbPath)
+  : isNodeTestProcess
+    ? path.join(os.tmpdir(), `qwenbridge-test-${process.pid}.db`)
+    : DEFAULT_DB_PATH;
+const DB_DIR = DB_PATH === ":memory:" ? null : path.dirname(DB_PATH);
+const usesDefaultDatabase = DB_PATH === DEFAULT_DB_PATH;
+const deletesDatabaseOnExit = isNodeTestProcess && !configuredDbPath;
 const LEGACY_DB_PATH = path.join(DATA_DIR, "qwenproxy.db");
-const LEGACY_DB_IN_DIR_PATH = path.join(DB_DIR, "qwenproxy.db");
+const LEGACY_DB_IN_DIR_PATH = path.join(DEFAULT_DB_DIR, "qwenproxy.db");
 const LEGACY_DB_WAL_PATH = `${LEGACY_DB_PATH}-wal`;
 const LEGACY_DB_SHM_PATH = `${LEGACY_DB_PATH}-shm`;
 const LEGACY_DB_IN_DIR_WAL_PATH = `${LEGACY_DB_IN_DIR_PATH}-wal`;
@@ -16,16 +31,15 @@ const DB_WAL_PATH = `${DB_PATH}-wal`;
 const DB_SHM_PATH = `${DB_PATH}-shm`;
 const LEGACY_JSON_PATH = path.resolve("accounts.json");
 const LEGACY_JSON_BAK_PATH = path.resolve("accounts.json.bak");
-const DB_JSON_BAK_PATH = path.join(DB_DIR, "accounts.json.bak");
+const DB_JSON_BAK_PATH = path.join(DEFAULT_DB_DIR, "accounts.json.bak");
 
 let db: Database.Database | null = null;
 
 export function getDatabase(): Database.Database {
   if (db) return db;
 
-  // Ensure data directory exists with proper permissions
   try {
-    if (!fs.existsSync(DB_DIR)) {
+    if (DB_DIR && !fs.existsSync(DB_DIR)) {
       fs.mkdirSync(DB_DIR, { recursive: true, mode: 0o755 });
     }
     const migrateLegacyDatabase = (
@@ -45,29 +59,32 @@ export function getDatabase(): Database.Database {
       }
     };
 
-    migrateLegacyDatabase(
-      LEGACY_DB_PATH,
-      LEGACY_DB_WAL_PATH,
-      LEGACY_DB_SHM_PATH,
-    );
-    migrateLegacyDatabase(
-      LEGACY_DB_IN_DIR_PATH,
-      LEGACY_DB_IN_DIR_WAL_PATH,
-      LEGACY_DB_IN_DIR_SHM_PATH,
-    );
-    if (
-      fs.existsSync(LEGACY_JSON_BAK_PATH) &&
-      !fs.existsSync(DB_JSON_BAK_PATH)
-    ) {
-      fs.renameSync(LEGACY_JSON_BAK_PATH, DB_JSON_BAK_PATH);
+    if (usesDefaultDatabase) {
+      migrateLegacyDatabase(
+        LEGACY_DB_PATH,
+        LEGACY_DB_WAL_PATH,
+        LEGACY_DB_SHM_PATH,
+      );
+      migrateLegacyDatabase(
+        LEGACY_DB_IN_DIR_PATH,
+        LEGACY_DB_IN_DIR_WAL_PATH,
+        LEGACY_DB_IN_DIR_SHM_PATH,
+      );
+      if (
+        fs.existsSync(LEGACY_JSON_BAK_PATH) &&
+        !fs.existsSync(DB_JSON_BAK_PATH)
+      ) {
+        fs.renameSync(LEGACY_JSON_BAK_PATH, DB_JSON_BAK_PATH);
+      }
     }
-    // Test write access
-    const testFile = path.join(DB_DIR, ".write-test");
-    fs.writeFileSync(testFile, "");
-    fs.unlinkSync(testFile);
+    if (DB_DIR) {
+      const testFile = path.join(DB_DIR, `.write-test-${process.pid}`);
+      fs.writeFileSync(testFile, "");
+      fs.unlinkSync(testFile);
+    }
   } catch (err: any) {
     console.error(
-      `❌ [Database] Cannot access database directory '${DB_DIR}':`,
+      `❌ [Database] Cannot access database directory '${DB_DIR ?? DB_PATH}':`,
       err.message,
     );
     console.error(
@@ -76,7 +93,7 @@ export function getDatabase(): Database.Database {
     console.error(
       "❌ [Database] In Docker, mount a volume: -v ./data:/app/data",
     );
-    throw new Error(`Database directory not accessible: ${DB_DIR}`);
+    throw new Error(`Database directory not accessible: ${DB_DIR ?? DB_PATH}`);
   }
 
   try {
@@ -98,7 +115,9 @@ export function getDatabase(): Database.Database {
   db.pragma("foreign_keys = ON");
 
   runMigrations(db);
-  migrateFromJson(db);
+  if (usesDefaultDatabase) {
+    migrateFromJson(db);
+  }
   encryptPlaintextPasswords(db);
 
   return db;
@@ -356,4 +375,13 @@ export function closeDatabase(): void {
     db.close();
     db = null;
   }
+}
+
+if (deletesDatabaseOnExit) {
+  process.once("exit", () => {
+    closeDatabase();
+    for (const filePath of [DB_PATH, DB_WAL_PATH, DB_SHM_PATH]) {
+      fs.rmSync(filePath, { force: true });
+    }
+  });
 }

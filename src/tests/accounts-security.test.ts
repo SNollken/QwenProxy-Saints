@@ -51,6 +51,19 @@ function restoreAccounts(rows: AccountRow[]): void {
 
 let restoreRows: AccountRow[] | null = null;
 
+test("database: test processes use an isolated temporary database", () => {
+  const databases = getDatabase()
+    .prepare("PRAGMA database_list")
+    .all() as Array<{ name: string; file: string }>;
+  const mainDatabase = databases.find((entry) => entry.name === "main");
+
+  assert.ok(mainDatabase);
+  assert.match(
+    mainDatabase.file,
+    new RegExp(`qwenbridge-test-${process.pid}\\.db$`),
+  );
+});
+
 afterEach(() => {
   if (restoreRows) {
     restoreAccounts(restoreRows);
