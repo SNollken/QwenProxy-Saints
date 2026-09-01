@@ -14,7 +14,10 @@ import {
 } from "../../services/qwen.ts";
 import type { TokenEstimationContext } from "../../services/token-estimation-metrics.ts";
 import { isAuthMockEnabled } from "../../services/auth-playwright.ts";
-import { refreshHeaders } from "../../services/playwright.ts";
+import {
+  getActivePlaywrightAccountIds,
+  refreshHeaders,
+} from "../../services/playwright.ts";
 import { Mutex } from "../../core/mutex.ts";
 import {
   getNextAccount,
@@ -23,10 +26,7 @@ import {
   getAccountCooldownInfo,
   clearAccountCooldown,
 } from "../../core/account-manager.ts";
-import {
-  getAccountCredentials,
-  loadAccounts,
-} from "../../core/accounts.ts";
+import { getAccountCredentials, loadAccounts } from "../../core/accounts.ts";
 import { registerStream, removeStream } from "../../core/stream-registry.ts";
 import {
   logger,
@@ -120,6 +120,30 @@ export interface AcquireParams {
   requestPersonalizationInstruction?: string | null;
 }
 
+export function selectWarmAccount<T extends { id: string }>(
+  accounts: T[],
+  activeAccountIds: ReadonlySet<string>,
+  startAccountId?: string | null,
+): T | undefined {
+  if (accounts.length === 0) return undefined;
+  const startIndex = Math.max(
+    0,
+    accounts.findIndex((candidate) => candidate.id === startAccountId),
+  );
+
+  for (let offset = 0; offset < accounts.length; offset++) {
+    const candidate = accounts[(startIndex + offset) % accounts.length];
+    if (
+      activeAccountIds.has(candidate.id) &&
+      !getAccountCooldownInfo(candidate.id)
+    ) {
+      return candidate;
+    }
+  }
+
+  return undefined;
+}
+
 function resolveInitialAccount(preferredAccountId?: string): {
   account: SelectedAccount;
   configuredAccounts: SelectedAccount[];
@@ -133,6 +157,7 @@ function resolveInitialAccount(preferredAccountId?: string): {
 
   const configuredAccounts = loadAccounts();
   if (configuredAccounts.length > 0) {
+    const account = getNextAccount();
     if (preferredAccountId) {
       const preferred = configuredAccounts.find(
         (candidate) => candidate.id === preferredAccountId,
@@ -140,7 +165,16 @@ function resolveInitialAccount(preferredAccountId?: string): {
       if (preferred) return { account: preferred, configuredAccounts };
     }
 
-    const account = getNextAccount();
+    const activeAccountIds = new Set(getActivePlaywrightAccountIds());
+    const warmAccount = selectWarmAccount(
+      configuredAccounts,
+      activeAccountIds,
+      account?.id,
+    );
+    if (warmAccount) {
+      return { account: warmAccount, configuredAccounts };
+    }
+
     if (!account) {
       // All accounts on cooldown; caller will handle this.
       return { account: configuredAccounts[0], configuredAccounts };

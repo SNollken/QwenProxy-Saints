@@ -7,13 +7,41 @@ import {
   getNextAvailableAccount,
   markAccountRateLimited,
 } from "../core/account-manager.ts";
+import { selectWarmAccount } from "../routes/chat/account.ts";
+
+test("Account Rotation: warm selection follows the round-robin anchor", () => {
+  const accounts = [
+    { id: "warm-1" },
+    { id: "cold-1" },
+    { id: "warm-2" },
+    { id: "cold-2" },
+  ];
+  const activeAccountIds = new Set(["warm-1", "warm-2"]);
+
+  assert.strictEqual(
+    selectWarmAccount(accounts, activeAccountIds, "warm-1")?.id,
+    "warm-1",
+  );
+  assert.strictEqual(
+    selectWarmAccount(accounts, activeAccountIds, "cold-1")?.id,
+    "warm-2",
+  );
+  assert.strictEqual(
+    selectWarmAccount(accounts, activeAccountIds, "cold-2")?.id,
+    "warm-1",
+  );
+});
 
 test("Account Rotation: Round-Robin rotation cycle", async () => {
   const originalEnv = process.env.QWEN_ACCOUNTS;
   delete process.env.QWEN_ACCOUNTS;
 
   const db = getDatabase();
-  const existing = db.prepare("SELECT id, email, password FROM accounts").all();
+  const existing = db
+    .prepare(
+      "SELECT id, email, password, cooldown_until, cooldown_reason FROM accounts",
+    )
+    .all();
   db.prepare("DELETE FROM accounts").run();
   invalidateAccountsCache();
 
@@ -43,10 +71,16 @@ test("Account Rotation: Round-Robin rotation cycle", async () => {
   } finally {
     db.prepare("DELETE FROM accounts").run();
     const insert = db.prepare(
-      "INSERT INTO accounts (id, email, password) VALUES (?, ?, ?)",
+      "INSERT INTO accounts (id, email, password, cooldown_until, cooldown_reason) VALUES (?, ?, ?, ?, ?)",
     );
     for (const row of existing as any[]) {
-      insert.run(row.id, row.email, row.password);
+      insert.run(
+        row.id,
+        row.email,
+        row.password,
+        row.cooldown_until ?? 0,
+        row.cooldown_reason ?? null,
+      );
     }
     invalidateAccountsCache();
     if (originalEnv !== undefined) {
@@ -60,7 +94,11 @@ test("Account Rotation: returns account with shortest cooldown when all accounts
   delete process.env.QWEN_ACCOUNTS;
 
   const db = getDatabase();
-  const existing = db.prepare("SELECT id, email, password FROM accounts").all();
+  const existing = db
+    .prepare(
+      "SELECT id, email, password, cooldown_until, cooldown_reason FROM accounts",
+    )
+    .all();
   db.prepare("DELETE FROM accounts").run();
   invalidateAccountsCache();
 
@@ -92,10 +130,16 @@ test("Account Rotation: returns account with shortest cooldown when all accounts
   } finally {
     db.prepare("DELETE FROM accounts").run();
     const insert = db.prepare(
-      "INSERT INTO accounts (id, email, password) VALUES (?, ?, ?)",
+      "INSERT INTO accounts (id, email, password, cooldown_until, cooldown_reason) VALUES (?, ?, ?, ?, ?)",
     );
     for (const row of existing as any[]) {
-      insert.run(row.id, row.email, row.password);
+      insert.run(
+        row.id,
+        row.email,
+        row.password,
+        row.cooldown_until ?? 0,
+        row.cooldown_reason ?? null,
+      );
     }
     invalidateAccountsCache();
     if (originalEnv !== undefined) {

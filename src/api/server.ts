@@ -24,7 +24,31 @@ let watchdog: Watchdog | undefined;
 let server: any;
 let startPromise: Promise<StartedServerInfo> | null = null;
 let stopPromise: Promise<void> | null = null;
+let accountPreparationPromise: Promise<void> | null = null;
 let signalHandlersInstalled = false;
+
+export function classifyStartupAccounts<
+  T extends { cooldown_until?: number | null },
+>(
+  accounts: T[],
+  now = Date.now(),
+): {
+  expiredCooldownAccounts: T[];
+  availableAccounts: T[];
+} {
+  return {
+    expiredCooldownAccounts: accounts.filter(
+      (account) =>
+        account.cooldown_until !== null &&
+        account.cooldown_until !== undefined &&
+        account.cooldown_until > 0 &&
+        account.cooldown_until <= now,
+    ),
+    availableAccounts: accounts.filter(
+      (account) => !account.cooldown_until || account.cooldown_until <= now,
+    ),
+  };
+}
 
 const app = new Hono();
 
@@ -289,6 +313,11 @@ async function prepareRemainingAccountsInBackground(params: {
 }
 
 async function cleanupServerResources(): Promise<void> {
+  const pendingAccountPreparation = accountPreparationPromise;
+  if (pendingAccountPreparation) {
+    await pendingAccountPreparation;
+  }
+
   watchdog?.stop();
   watchdog = undefined;
   metrics.stopCollection();
@@ -405,17 +434,18 @@ export async function startServer(options?: {
       await import("../core/accounts.ts");
     const accounts = loadAccounts();
 
-    // Clear stale cooldowns from previous sessions on startup
     const { clearAccountCooldown } = await import("../core/account-manager.ts");
-    for (const account of accounts) {
+    const now = Date.now();
+    const { expiredCooldownAccounts, availableAccounts } =
+      classifyStartupAccounts(accounts, now);
+    for (const account of expiredCooldownAccounts) {
       clearAccountCooldown(account.id);
     }
-    if (accounts.length > 0) {
+    if (expiredCooldownAccounts.length > 0) {
       console.log(
-        `🧹 [Server] Cleared stale cooldowns for ${accounts.length} account(s)`,
+        `🧹 [Server] Cleared expired cooldowns for ${expiredCooldownAccounts.length} account(s)`,
       );
     }
-
     const { disableNativeTools, warmQwenChatPool } =
       await import("../services/qwen.ts");
     const { initPlaywrightForAccount } =
@@ -423,43 +453,61 @@ export async function startServer(options?: {
 
     const BATCH_SIZE = config.playwright.initBatchSize;
 
-    if (accounts.length > 0) {
-      console.log(`🔐 [Server] Preparing first available Qwen account...`);
-      let readyAccountIndex = -1;
-      for (let i = 0; i < accounts.length; i++) {
-        const ok = await prepareAccountRuntime(
-          accounts[i],
-          getAccountCredentials,
-          initPlaywrightForAccount,
-          disableNativeTools,
-          warmQwenChatPool,
-        );
-        if (ok) {
-          readyAccountIndex = i;
-          break;
+    if (availableAccounts.length > 0) {
+      const preparationPromise = (async () => {
+        console.log(`🔐 [Server] Preparing first available Qwen account...`);
+        let readyAccountIndex = -1;
+        for (let i = 0; i < availableAccounts.length; i++) {
+          const ok = await prepareAccountRuntime(
+            availableAccounts[i],
+            getAccountCredentials,
+            initPlaywrightForAccount,
+            disableNativeTools,
+            warmQwenChatPool,
+          );
+          if (ok) {
+            readyAccountIndex = i;
+            break;
+          }
         }
-      }
 
-      const remainingAccounts = accounts.filter(
-        (_account, index) => index !== readyAccountIndex,
-      );
-      if (readyAccountIndex === -1) {
-        console.warn(
-          `⚠️  [Server] No account ready during startup; continuing in background`,
+        const remainingAccounts = availableAccounts.filter(
+          (_account, index) => index !== readyAccountIndex,
         );
-      }
-      void prepareRemainingAccountsInBackground({
-        accounts: remainingAccounts,
-        batchSize: BATCH_SIZE,
-        getAccountCredentials,
-        initPlaywrightForAccount,
-        disableNativeTools,
-        warmQwenChatPool,
-      }).catch((error) => {
+        if (readyAccountIndex === -1) {
+          console.warn(
+            `⚠️  [Server] No account ready during startup; continuing in background`,
+          );
+        }
+        if (process.env.PREPARE_ALL_ON_STARTUP === "true") {
+          await prepareRemainingAccountsInBackground({
+            accounts: remainingAccounts,
+            batchSize: BATCH_SIZE,
+            getAccountCredentials,
+            initPlaywrightForAccount,
+            disableNativeTools,
+            warmQwenChatPool,
+          });
+        } else {
+          console.log(
+            `⏭️  [Server] Background account preparation disabled; accounts will init on first request.`,
+          );
+        }
+      })().catch((error) => {
         console.warn(
-          `❌ [Server] Background account preparation failed: ${getErrorMessage(error)}`,
+          `❌ [Server] Initial account preparation failed: ${getErrorMessage(error)}`,
         );
       });
+      accountPreparationPromise = preparationPromise;
+      void preparationPromise.finally(() => {
+        if (accountPreparationPromise === preparationPromise) {
+          accountPreparationPromise = null;
+        }
+      });
+    } else if (accounts.length > 0) {
+      console.warn(
+        `⚠️  [Server] All Qwen accounts are on cooldown; skipping startup preparation.`,
+      );
     } else {
       console.warn(
         `⚠️  [Server] No Qwen accounts configured. Add accounts with npm run login before sending requests.`,

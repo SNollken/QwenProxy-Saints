@@ -80,12 +80,10 @@ const accountPages = new Map<string, Page>();
 // Header cache per account
 interface AccountHeaderCache {
   headers: Record<string, string>;
-  lastRefresh: number;
   refreshInProgress: boolean;
 }
 
 const headerCaches = new Map<string, AccountHeaderCache>();
-const HEADER_CACHE_TTL = 5 * 60 * 1000; // 5 minutes (matches Alibaba token lifetime)
 const COOKIE_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
 const cookieCaches = new Map<string, { cookie: string; timestamp: number }>();
 const lastAccountActivity = new Map<string, number>();
@@ -277,7 +275,6 @@ function getHeaderCache(accountId: string): AccountHeaderCache {
   if (!cache) {
     cache = {
       headers: {},
-      lastRefresh: 0,
       refreshInProgress: false,
     };
     headerCaches.set(accountId, cache);
@@ -329,35 +326,10 @@ export async function getBasicHeaders(accountId: string): Promise<{
 
     const cache = getHeaderCache(accountId);
 
-    // Refresh headers if stale
-    const headersAge = Date.now() - cache.lastRefresh;
-    if (headersAge > HEADER_CACHE_TTL && !cache.refreshInProgress) {
-      await refreshHeadersInternal(accountId);
-    }
+    const bxUa = cache.headers["bx-ua"] || "";
+    const bxUmidtoken = cache.headers["bx-umidtoken"] || "";
+    const bxV = cache.headers["bx-v"] || "2.5.36";
 
-    let bxUa = cache.headers["bx-ua"] || "";
-    let bxUmidtoken = cache.headers["bx-umidtoken"] || "";
-    let bxV = cache.headers["bx-v"] || "2.5.36";
-
-    // Auto-recover missing anti-fraud headers by triggering full header interception
-    if (!bxUa || !bxUmidtoken) {
-      console.log(
-        `🔄 [Playwright] Missing bx-ua/bx-umidtoken for ${accountId}, triggering header interception...`,
-      );
-      try {
-        await refreshHeadersInternal(accountId);
-        const refreshedCache = getHeaderCache(accountId);
-        bxUa = refreshedCache.headers["bx-ua"] || bxUa;
-        bxUmidtoken = refreshedCache.headers["bx-umidtoken"] || bxUmidtoken;
-        bxV = refreshedCache.headers["bx-v"] || bxV;
-      } catch (err: any) {
-        console.warn(
-          `❌ [Playwright] Failed to auto-recover headers for ${accountId}: ${err.message}`,
-        );
-      }
-    }
-
-    // Read cookie AFTER all refreshes (re-login may have updated it)
     const cookie = await getCookies(accountId);
 
     touchAccountActivity(accountId);
@@ -699,7 +671,6 @@ async function captureHeaders(accountId: string): Promise<void> {
         "bx-v": reqHeaders["bx-v"] || "2.5.36",
         "user-agent": reqHeaders["user-agent"] || "",
       };
-      cache.lastRefresh = Date.now();
       touchAccountActivity(accountId);
 
       console.log(`✅ [Playwright] Headers captured for ${accountId}`);

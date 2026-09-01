@@ -3,7 +3,32 @@ import assert from "node:assert/strict";
 import net from "node:net";
 import { getDatabase } from "../core/database.ts";
 import { invalidateAccountsCache } from "../core/accounts.ts";
-import { startServer, stopServer } from "../api/server.ts";
+import {
+  classifyStartupAccounts,
+  startServer,
+  stopServer,
+} from "../api/server.ts";
+
+test("startup preserves active cooldowns and only clears expired ones", () => {
+  const now = 1_000_000;
+  const accounts = [
+    { id: "active", cooldown_until: now + 60_000 },
+    { id: "expired", cooldown_until: now - 1 },
+    { id: "never", cooldown_until: 0 },
+    { id: "unset", cooldown_until: null },
+  ];
+
+  const result = classifyStartupAccounts(accounts, now);
+
+  assert.deepEqual(
+    result.expiredCooldownAccounts.map((account) => account.id),
+    ["expired"],
+  );
+  assert.deepEqual(
+    result.availableAccounts.map((account) => account.id),
+    ["expired", "never", "unset"],
+  );
+});
 
 function isPortAvailable(port: number): Promise<boolean> {
   return new Promise((resolve) => {
