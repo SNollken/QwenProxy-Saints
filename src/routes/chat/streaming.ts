@@ -18,7 +18,10 @@ import {
 } from "../../services/qwen.ts";
 import type { OpenAIRequest, Usage } from "../../utils/types.ts";
 import { StreamingToolParser } from "../../tools/parser.ts";
-import { StreamingReasoningTagSanitizer } from "../../utils/reasoning-tags.ts";
+import {
+  normalizeCumulativeReasoningContent,
+  StreamingReasoningTagSanitizer,
+} from "../../utils/reasoning-tags.ts";
 import {
   getStream,
   removeStream,
@@ -295,6 +298,36 @@ export async function processNonStreamingResponse(
       }
     };
 
+    const getAnswerDelta = (content: string) => {
+      const normalized = normalizeCumulativeReasoningContent(content);
+      if (normalized.detectedOrphanClose && !loggedThinkTagLeak) {
+        logger.warn(
+          "[chat] Detected orphan </think> tag in answer content; sanitizing output",
+          {
+            completionId,
+            mode: "non-stream",
+            model: body.model,
+          },
+        );
+        loggedThinkTagLeak = true;
+      }
+      if (normalized.detectedOrphanClose) {
+        reasoningTagSanitizer?.discardPendingOrphanClose();
+      }
+      const result = getIncrementalDelta(
+        lastRawContent,
+        normalized.content,
+        lastRawContentLength,
+        lastRawContentSuffix,
+      );
+      lastRawContent = normalized.detectedOrphanClose
+        ? normalized.content
+        : result.matchedContent;
+      lastRawContentLength = lastRawContent.length;
+      lastRawContentSuffix = lastRawContent.slice(-64);
+      return result.delta;
+    };
+
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
@@ -415,18 +448,8 @@ export async function processNonStreamingResponse(
             } else if (delta.phase === "answer") {
               isThinkingChunk = false;
               if (delta.content !== undefined) {
-                const newContent = delta.content || "";
-                const result = getIncrementalDelta(
-                  lastRawContent,
-                  newContent,
-                  lastRawContentLength,
-                  lastRawContentSuffix,
-                );
-                vStr = result.delta;
+                vStr = getAnswerDelta(delta.content || "");
                 if (vStr) {
-                  lastRawContent = result.matchedContent;
-                  lastRawContentLength = result.contentLength;
-                  lastRawContentSuffix = result.contentSuffix;
                   foundStr = true;
                 }
               }
@@ -499,9 +522,12 @@ export async function processNonStreamingResponse(
 
     const remainingParsed = toolParser
       ? toolParser.flush()
-      : { text: "", toolCalls: [] };
-    const { text: remainingText, toolCalls: remainingToolCalls } =
-      remainingParsed;
+      : { text: "", toolCalls: [], truncatedToolCall: false };
+    const {
+      text: remainingText,
+      toolCalls: remainingToolCalls,
+      truncatedToolCall,
+    } = remainingParsed;
 
     if (toolParser && isToolcallDebugEnabled()) {
       logger.debug("[chat] non-stream: parser flush result", {
@@ -547,7 +573,11 @@ export async function processNonStreamingResponse(
       message.tool_calls = toolCallsOut;
     }
 
-    const finishReason = toolCallsOut.length ? "tool_calls" : "stop";
+    const finishReason = truncatedToolCall
+      ? "length"
+      : toolCallsOut.length
+        ? "tool_calls"
+        : "stop";
 
     if (isToolcallDebugEnabled()) {
       logger.debug("[chat] non-stream: sending response", {
@@ -817,9 +847,7 @@ export async function processStreamingResponse(
       let reasoningBuffer = "";
       let targetResponseId: string | null = null;
       const toolParser = shouldParseToolCalls
-        ? new StreamingToolParser(declaredTools, {
-            incrementalToolCalls: true,
-          })
+        ? new StreamingToolParser(declaredTools)
         : null;
       // Skip sanitizer allocation for no-thinking model variants
       const enableThinking = !body.model.endsWith("-no-thinking");
@@ -1004,6 +1032,36 @@ export async function processStreamingResponse(
         }
       };
 
+      const getAnswerDelta = (content: string) => {
+        const normalized = normalizeCumulativeReasoningContent(content);
+        if (normalized.detectedOrphanClose && !loggedThinkTagLeak) {
+          logger.warn(
+            "[chat] Detected orphan </think> tag in answer content; sanitizing output",
+            {
+              completionId,
+              mode: "stream",
+              model: body.model,
+            },
+          );
+          loggedThinkTagLeak = true;
+        }
+        if (normalized.detectedOrphanClose) {
+          reasoningTagSanitizer?.discardPendingOrphanClose();
+        }
+        const result = getIncrementalDelta(
+          lastRawContent,
+          normalized.content,
+          lastRawContentLength,
+          lastRawContentSuffix,
+        );
+        lastRawContent = normalized.detectedOrphanClose
+          ? normalized.content
+          : result.matchedContent;
+        lastRawContentLength = lastRawContent.length;
+        lastRawContentSuffix = lastRawContent.slice(-64);
+        return result.delta;
+      };
+
       // Main SSE reader loop
       while (true) {
         if (clientDisconnected) {
@@ -1053,17 +1111,8 @@ export async function processStreamingResponse(
               .replace(/\\\\/g, "\\");
 
             if (unescaped) {
-              const result = getIncrementalDelta(
-                lastRawContent,
-                unescaped,
-                lastRawContentLength,
-                lastRawContentSuffix,
-              );
-              const vStr = result.delta;
+              const vStr = getAnswerDelta(unescaped);
               if (vStr && vStr !== "FINISHED") {
-                lastRawContent = result.matchedContent;
-                lastRawContentLength = result.contentLength;
-                lastRawContentSuffix = result.contentSuffix;
                 await emitSanitizedAnswerChunk(vStr);
               }
             }
@@ -1175,18 +1224,8 @@ export async function processStreamingResponse(
               } else if (delta.phase === "answer") {
                 isThinkingChunk = false;
                 if (delta.content !== undefined) {
-                  const newContent = delta.content || "";
-                  const result = getIncrementalDelta(
-                    lastRawContent,
-                    newContent,
-                    lastRawContentLength,
-                    lastRawContentSuffix,
-                  );
-                  vStr = result.delta;
+                  vStr = getAnswerDelta(delta.content || "");
                   if (vStr) {
-                    lastRawContent = result.matchedContent;
-                    lastRawContentLength = result.contentLength;
-                    lastRawContentSuffix = result.contentSuffix;
                     foundStr = true;
                   }
                 }
@@ -1282,11 +1321,17 @@ export async function processStreamingResponse(
 
       const remainingParsed = toolParser
         ? toolParser.flush()
-        : { text: "", toolCalls: [], toolCallDeltas: [] };
+        : {
+            text: "",
+            toolCalls: [],
+            toolCallDeltas: [],
+            truncatedToolCall: false,
+          };
       const {
         text: remainingText,
         toolCalls: remainingToolCalls,
         toolCallDeltas: remainingToolCallDeltas,
+        truncatedToolCall,
       } = remainingParsed;
 
       if (toolParser && isToolcallDebugEnabled()) {
@@ -1295,6 +1340,7 @@ export async function processStreamingResponse(
           remainingToolCallsCount: remainingToolCalls.length,
           remainingToolCallNames: remainingToolCalls.map((tc) => tc.name),
           remainingToolCallDeltaCount: remainingToolCallDeltas.length,
+          truncatedToolCall,
           totalEmittedToolCalls: toolParser.getEmittedToolCallCount(),
         });
       }
@@ -1391,8 +1437,9 @@ export async function processStreamingResponse(
       // Finish reason + usage + [DONE]
       const usage = buildUsage(usageAccumulator);
 
-      const finalFinishReason =
-        toolParser && toolParser.getEmittedToolCallCount() > 0
+      const finalFinishReason = truncatedToolCall
+        ? "length"
+        : toolParser && toolParser.getEmittedToolCallCount() > 0
           ? "tool_calls"
           : "stop";
 

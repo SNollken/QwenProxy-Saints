@@ -18,6 +18,7 @@ export interface ParserResult {
   text: string;
   toolCalls: ParsedToolCall[];
   toolCallDeltas: ToolCallDelta[];
+  truncatedToolCall: boolean;
 }
 
 export interface StreamingToolParserOptions {
@@ -128,7 +129,11 @@ function findNextToolOpenTagOutsideMarkdownCode(
     }
 
     if (delimiterLength === 0) {
-      const match = buffer.substring(i).match(/^<tool_call\b[^>]*>/i);
+      const match = buffer
+        .substring(i)
+        .match(
+          /^<tool_call(?:\b[^>\r\n]*|[_~!:-][^>\r\n]*)(?:>|\r?\n)/i,
+        );
       if (match) {
         return { index: i, openTag: match[0] };
       }
@@ -138,6 +143,29 @@ function findNextToolOpenTagOutsideMarkdownCode(
   }
 
   return null;
+}
+
+function getToolCloseTag(openTag: string): string {
+  const namedMatch = openTag.match(/^<tool_call_([a-z0-9_-]+)>$/i);
+  return namedMatch ? `</tool_call_${namedMatch[1]}>` : TOOL_END;
+}
+
+function findToolCloseTag(
+  buffer: string,
+  openTag: string,
+): { index: number; length: number } | null {
+  const expectedTag = getToolCloseTag(openTag);
+  const expectedIndex = buffer.toLowerCase().indexOf(expectedTag.toLowerCase());
+  if (expectedIndex !== -1) {
+    return { index: expectedIndex, length: expectedTag.length };
+  }
+
+  const malformedMatch = buffer.match(
+    /<\/tool_call(?:\b[^>\r\n]*|[_~!:-][^>\r\n]*)(?:>|\r?\n)/i,
+  );
+  return malformedMatch?.index === undefined
+    ? null
+    : { index: malformedMatch.index, length: malformedMatch[0].length };
 }
 
 function findPartialToolOpenIndexOutsideMarkdownCode(
@@ -166,7 +194,12 @@ function findPartialToolOpenIndexOutsideMarkdownCode(
 
     if (delimiterLength === 0 && buffer[i] === "<") {
       const tailLower = buffer.substring(i).toLowerCase();
-      if (tailLower.startsWith("<tool_call") && tailLower.indexOf(">") === -1) {
+      if (
+        tailLower.startsWith(lowerToolStart) &&
+        tailLower.indexOf(">") === -1 &&
+        (tailLower.length === lowerToolStart.length ||
+          /^[\s_~!:\-]/.test(tailLower[lowerToolStart.length]))
+      ) {
         return i;
       }
       if (lowerToolStart.startsWith(tailLower)) {
@@ -1051,6 +1084,7 @@ export class StreamingToolParser {
       text: "",
       toolCalls: [],
       toolCallDeltas: [],
+      truncatedToolCall: false,
     };
 
     while (this.buffer.length > 0) {
@@ -1143,21 +1177,21 @@ export class StreamingToolParser {
           break;
         }
       } else {
-        // Inside tool: look for </tool_call>
-        const lowerBuffer = this.buffer.toLowerCase();
-        const endIdx = lowerBuffer.indexOf(TOOL_END);
-        if (endIdx !== -1) {
-          const content = this.buffer.substring(0, endIdx);
+        const closeTag = findToolCloseTag(this.buffer, this.currentOpenTag);
+        if (closeTag) {
+          const content = this.buffer.substring(0, closeTag.index);
           if (isToolcallDebugEnabled()) {
             logger.debug("[parser] tool_call close tag detected", {
               contentLength: content.length,
               contentPreview: content.substring(0, 300),
               remainingBufferLength:
-                this.buffer.length - endIdx - TOOL_END.length,
+                this.buffer.length - closeTag.index - closeTag.length,
             });
           }
           this.emitIncrementalToolCallDeltas(content, result);
-          this.buffer = this.buffer.substring(endIdx + TOOL_END.length);
+          this.buffer = this.buffer.substring(
+            closeTag.index + closeTag.length,
+          );
           this.processToolContent(content, result);
           this.insideTool = false;
           this.currentOpenTag = TOOL_START_LITERAL;
@@ -1209,8 +1243,9 @@ export class StreamingToolParser {
       text: "",
       toolCalls: [],
       toolCallDeltas: [],
+      truncatedToolCall: false,
     };
-    if (!this.buffer && !this.pendingLeadIn) return result;
+    if (!this.buffer && !this.pendingLeadIn && !this.insideTool) return result;
 
     if (this.insideTool) {
       // Stream ended with unclosed <tool_call>. Try to recover.
@@ -1239,11 +1274,7 @@ export class StreamingToolParser {
           }
           this.finalizeSuccessfulToolCall(recovered, result);
         } else {
-          // Recovery failed. Emit warning text so the client knows content was lost.
           const toolName = this.extractToolNameFromTruncated(trimmed);
-          const warningMsg = toolName
-            ? `\n\n[WARNING: Tool call "${toolName}" was truncated by the model's token limit and could not be recovered. The response was cut off before the tool call completed. You may need to retry with a smaller request or split the operation.]\n\n`
-            : `\n\n[WARNING: A tool call was truncated by the model's token limit and could not be recovered. The response was cut off before the tool call completed.]\n\n`;
           logger.warn(
             "[parser] Dropping unrecoverable unclosed tool call at end of stream",
             {
@@ -1251,32 +1282,36 @@ export class StreamingToolParser {
               toolName,
             },
           );
-          result.text += warningMsg;
-          if (
-            this.emittedToolCallCount === 0 &&
-            this.pendingLeadIn.trim().length > 0
-          ) {
-            result.text += this.pendingLeadIn;
-          }
+          result.truncatedToolCall = true;
           this.pendingLeadIn = "";
         }
       } else {
-        // Empty tool call block - restore lead-in
-        if (isToolcallDebugEnabled()) {
-          logger.debug(
-            "[parser] flush: empty tool call block, restoring lead-in",
-          );
-        }
-        if (
-          this.emittedToolCallCount === 0 &&
-          this.pendingLeadIn.trim().length > 0
-        ) {
-          result.text += this.pendingLeadIn;
-        }
+        logger.warn(
+          "[parser] Dropping empty unclosed tool call at end of stream",
+        );
+        result.truncatedToolCall = true;
         this.pendingLeadIn = "";
       }
     } else {
-      this.emitVisibleText(result, this.buffer);
+      const partialOpenIndex = findPartialToolOpenIndexOutsideMarkdownCode(
+        this.buffer,
+        this.markdownCodeDelimiterLength,
+      );
+      if (partialOpenIndex !== -1) {
+        this.emitVisibleText(
+          result,
+          this.buffer.substring(0, partialOpenIndex),
+        );
+        logger.warn(
+          "[parser] Dropping partial tool_call open tag at end of stream",
+          {
+            bufferPreview: this.buffer.substring(partialOpenIndex, 500),
+          },
+        );
+        result.truncatedToolCall = true;
+      } else {
+        this.emitVisibleText(result, this.buffer);
+      }
     }
 
     if (isToolcallDebugEnabled()) {
@@ -1285,6 +1320,7 @@ export class StreamingToolParser {
         toolCallsCount: result.toolCalls.length,
         toolCallNames: result.toolCalls.map((tc) => tc.name),
         toolCallDeltaCount: result.toolCallDeltas.length,
+        truncatedToolCall: result.truncatedToolCall,
         totalEmittedToolCalls: this.emittedToolCallCount,
       });
     }

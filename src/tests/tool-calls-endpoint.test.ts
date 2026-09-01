@@ -485,7 +485,7 @@ test("stream: fragmented tool_call becomes structured tool_calls", async () => {
   }
 });
 
-test("stream: write_file arguments are emitted incrementally before tool close", async () => {
+test("stream: write_file arguments are emitted once after tool close", async () => {
   const content1 =
     '<tool_call>{"name":"write_file","arguments":{"path":"index.html","content":"<h1';
   const content2 =
@@ -531,10 +531,7 @@ test("stream: write_file arguments are emitted incrementally before tool close",
     assert.strictEqual(result.content, "");
     assert.strictEqual(result.toolCalls.length, 1);
     assert.strictEqual(result.toolCalls[0].name, "write_file");
-    assert.ok(
-      result.toolCallDeltaCount >= 3,
-      `Expected multiple incremental tool call deltas, got ${result.toolCallDeltaCount}`,
-    );
+    assert.strictEqual(result.toolCallDeltaCount, 1);
     assert.deepStrictEqual(JSON.parse(result.toolCalls[0].arguments), {
       path: "index.html",
       content: "<h1>Hello</h1>\n<p>World</p>",
@@ -734,6 +731,72 @@ test("stream: unclosed tool_call is recovered on flush", async () => {
       path: "a.txt",
     });
     assert.strictEqual(result.finishReason, "tool_calls");
+  } finally {
+    restore();
+  }
+});
+
+test("non-stream: bare tool_call marker requests continuation without leaking text", async () => {
+  const restore = setupFetchMock(() =>
+    createSseResponse([
+      `data: ${JSON.stringify({
+        choices: [{ delta: { phase: "answer", content: "<tool_call" } }],
+      })}`,
+    ]),
+  );
+
+  try {
+    const req = new Request("http://localhost/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "qwen3.6-plus",
+        stream: false,
+        tools: TOOLS,
+        messages: [{ role: "user", content: "read a file" }],
+      }),
+    });
+
+    const res = await app.fetch(req);
+    assert.strictEqual(res.status, 200);
+
+    const body = await res.json();
+    assert.strictEqual(body.choices[0].message.content, "");
+    assert.strictEqual(body.choices[0].message.tool_calls, undefined);
+    assert.strictEqual(body.choices[0].finish_reason, "length");
+  } finally {
+    restore();
+  }
+});
+
+test("stream: bare tool_call marker requests continuation without leaking text", async () => {
+  const restore = setupFetchMock(() =>
+    createSseResponse([
+      `data: ${JSON.stringify({
+        choices: [{ delta: { phase: "answer", content: "<tool_call" } }],
+      })}`,
+    ]),
+  );
+
+  try {
+    const req = new Request("http://localhost/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "qwen3.6-plus",
+        stream: true,
+        tools: TOOLS,
+        messages: [{ role: "user", content: "read a file" }],
+      }),
+    });
+
+    const res = await app.fetch(req);
+    assert.strictEqual(res.status, 200);
+
+    const result = await collectStreamResult(res);
+    assert.strictEqual(result.content, "");
+    assert.strictEqual(result.toolCalls.length, 0);
+    assert.strictEqual(result.finishReason, "length");
   } finally {
     restore();
   }

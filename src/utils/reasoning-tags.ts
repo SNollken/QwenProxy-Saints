@@ -15,13 +15,10 @@ const THINK_OPEN_RE = /<think\b[^>]*>/i;
 const THINK_START_LITERAL = "<think>";
 const THINK_CLOSE_LITERAL = "</think>";
 
-function findPartialThinkOpenIndex(buffer: string): number {
+function findPartialTagIndex(buffer: string, literal: string): number {
   const lower = buffer.toLowerCase();
-  const idx = lower.lastIndexOf("<think");
-  if (idx !== -1 && lower.indexOf(">", idx) === -1) return idx;
-
-  for (let i = 1; i < THINK_START_LITERAL.length; i++) {
-    if (lower.endsWith(THINK_START_LITERAL.substring(0, i))) {
+  for (let i = 1; i < literal.length; i++) {
+    if (lower.endsWith(literal.substring(0, i))) {
       return buffer.length - i;
     }
   }
@@ -29,10 +26,58 @@ function findPartialThinkOpenIndex(buffer: string): number {
   return -1;
 }
 
+function findPartialThinkOpenIndex(buffer: string): number {
+  const lower = buffer.toLowerCase();
+  const idx = lower.lastIndexOf("<think");
+  if (idx !== -1 && lower.indexOf(">", idx) === -1) return idx;
+  return findPartialTagIndex(buffer, THINK_START_LITERAL);
+}
+
+function findPartialThinkCloseIndex(buffer: string): number {
+  return findPartialTagIndex(buffer, THINK_CLOSE_LITERAL);
+}
+
+export interface CumulativeReasoningContent {
+  content: string;
+  detectedOrphanClose: boolean;
+}
+
+export function normalizeCumulativeReasoningContent(
+  content: string,
+): CumulativeReasoningContent {
+  const lower = content.toLowerCase();
+  const closeIndex = lower.indexOf(THINK_CLOSE_LITERAL);
+  const openMatch = content.match(THINK_OPEN_RE);
+  const openIndex = openMatch?.index ?? -1;
+
+  if (closeIndex !== -1 && (openIndex === -1 || closeIndex < openIndex)) {
+    const before = content.substring(0, closeIndex).trimEnd();
+    const after = content
+      .substring(closeIndex + THINK_CLOSE_LITERAL.length)
+      .trimStart();
+
+    if (!after || after.trim() === before.trim()) {
+      return { content: before, detectedOrphanClose: true };
+    }
+
+    return { content: after, detectedOrphanClose: true };
+  }
+
+  return { content, detectedOrphanClose: false };
+}
+
 export class StreamingReasoningTagSanitizer {
   private buffer = "";
   private insideThink = false;
   private currentOpenTag = "";
+
+  discardPendingOrphanClose(): void {
+    if (this.insideThink) return;
+    const partialCloseIndex = findPartialThinkCloseIndex(this.buffer);
+    if (partialCloseIndex !== -1) {
+      this.buffer = this.buffer.substring(0, partialCloseIndex);
+    }
+  }
 
   feed(chunk: string): ReasoningTagParseResult {
     this.buffer += chunk;
@@ -48,6 +93,19 @@ export class StreamingReasoningTagSanitizer {
       if (!this.insideThink) {
         const openMatch = this.buffer.match(THINK_OPEN_RE);
         const openIndex = openMatch?.index ?? -1;
+        const closeIndex = this.buffer
+          .toLowerCase()
+          .indexOf(THINK_CLOSE_LITERAL);
+
+        if (closeIndex !== -1 && (openIndex === -1 || closeIndex < openIndex)) {
+          result.text += this.buffer.substring(0, closeIndex);
+          this.buffer = this.buffer.substring(
+            closeIndex + THINK_CLOSE_LITERAL.length,
+          );
+          result.detectedThinkTag = true;
+          result.hadMalformedTag = true;
+          continue;
+        }
 
         if (openMatch && openIndex !== -1) {
           result.text += this.buffer.substring(0, openIndex);
@@ -58,8 +116,15 @@ export class StreamingReasoningTagSanitizer {
         }
 
         const partialOpenIndex = findPartialThinkOpenIndex(this.buffer);
+        const partialCloseIndex = findPartialThinkCloseIndex(this.buffer);
         const flushIndex =
-          partialOpenIndex === -1 ? this.buffer.length : partialOpenIndex;
+          partialOpenIndex === -1
+            ? partialCloseIndex === -1
+              ? this.buffer.length
+              : partialCloseIndex
+            : partialCloseIndex === -1
+              ? partialOpenIndex
+              : Math.min(partialOpenIndex, partialCloseIndex);
         if (flushIndex > 0) {
           result.text += this.buffer.substring(0, flushIndex);
           this.buffer = this.buffer.substring(flushIndex);
@@ -104,7 +169,18 @@ export class StreamingReasoningTagSanitizer {
       result.hadMalformedTag = true;
       result.hadUnclosedTag = true;
     } else {
-      result.text = this.buffer;
+      const partialCloseIndex = findPartialThinkCloseIndex(this.buffer);
+      const partialClose =
+        partialCloseIndex === -1
+          ? ""
+          : this.buffer.substring(partialCloseIndex).toLowerCase();
+      if (partialClose.startsWith("</")) {
+        result.text = this.buffer.substring(0, partialCloseIndex);
+        result.detectedThinkTag = true;
+        result.hadMalformedTag = true;
+      } else {
+        result.text = this.buffer;
+      }
     }
 
     this.buffer = "";

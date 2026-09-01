@@ -74,6 +74,49 @@ test("StreamingToolParser: basic tool call", () => {
   assert.strictEqual(result.toolCalls[0].name, "t1");
 });
 
+test("StreamingToolParser: parses tool-specific wrapper tags", () => {
+  const parser = new StreamingToolParser();
+  const result = parser.feed(
+    '<tool_call_terminal>{"name":"terminal","arguments":{"command":"printf ok"}}</tool_call_terminal>',
+  );
+
+  assert.strictEqual(result.toolCalls.length, 1);
+  assert.strictEqual(result.toolCalls[0].name, "terminal");
+  assert.deepStrictEqual(result.toolCalls[0].arguments, {
+    command: "printf ok",
+  });
+});
+
+test("StreamingToolParser: recovers punctuated wrapper tags", () => {
+  const parser = new StreamingToolParser();
+  const result = parser.feed(
+    '<tool_call>{"name":"terminal","arguments":{"command":"echo ok"}}</tool_call~>' +
+      '<tool_call~!>{"name":"read_file","arguments":{"path":"/tmp/a"}}</tool_call~>',
+  );
+
+  assert.strictEqual(result.toolCalls.length, 2);
+  assert.deepStrictEqual(
+    result.toolCalls.map((call) => [call.name, call.arguments]),
+    [
+      ["terminal", { command: "echo ok" }],
+      ["read_file", { path: "/tmp/a" }],
+    ],
+  );
+});
+
+test("StreamingToolParser: recovers newline-terminated wrapper tags", () => {
+  const parser = new StreamingToolParser();
+  const result = parser.feed(
+    '<tool_call\r\n\r\n{"name":"terminal","arguments":{"command":"printf ok"}}\r\n</tool_call\r\n',
+  );
+
+  assert.strictEqual(result.toolCalls.length, 1);
+  assert.strictEqual(result.toolCalls[0].name, "terminal");
+  assert.deepStrictEqual(result.toolCalls[0].arguments, {
+    command: "printf ok",
+  });
+});
+
 test("StreamingToolParser: multiple tool calls", () => {
   const parser = new StreamingToolParser();
 
@@ -104,9 +147,31 @@ test("StreamingToolParser: fragmented tool call", () => {
 test("StreamingToolParser: flush partial content", () => {
   const parser = new StreamingToolParser();
 
-  // Partial tag at end - flush should return it as text
-  parser.feed("Unfinished tag <tool_");
-  assert.strictEqual(parser.flush().text, "<tool_");
+  assert.strictEqual(parser.feed("Unfinished tag <tool_").text, "Unfinished tag ");
+  const partialTag = parser.flush();
+  assert.strictEqual(partialTag.text, "");
+  assert.strictEqual(partialTag.truncatedToolCall, true);
+
+  const bareMarkerParser = new StreamingToolParser(TOOLS);
+  assert.strictEqual(bareMarkerParser.feed("<tool_call").text, "");
+  const bareMarker = bareMarkerParser.flush();
+  assert.strictEqual(bareMarker.text, "");
+  assert.strictEqual(bareMarker.toolCalls.length, 0);
+  assert.strictEqual(bareMarker.truncatedToolCall, true);
+
+  const emptyBlockParser = new StreamingToolParser(TOOLS);
+  assert.strictEqual(emptyBlockParser.feed("<tool_call>").text, "");
+  const emptyBlock = emptyBlockParser.flush();
+  assert.strictEqual(emptyBlock.text, "");
+  assert.strictEqual(emptyBlock.toolCalls.length, 0);
+  assert.strictEqual(emptyBlock.truncatedToolCall, true);
+
+  for (const literal of ["<tool_calls", "<tool_calligraphy"]) {
+    const literalParser = new StreamingToolParser(TOOLS);
+    const fed = literalParser.feed(`Literal ${literal}`);
+    const visibleText = fed.text + literalParser.flush().text;
+    assert.strictEqual(visibleText, `Literal ${literal}`);
+  }
 
   // Incomplete JSON in tool call - flush should recover it
   const parser2 = new StreamingToolParser();
@@ -114,18 +179,14 @@ test("StreamingToolParser: flush partial content", () => {
   const flushed = parser2.flush();
   assert.strictEqual(flushed.toolCalls.length, 1);
   assert.strictEqual(flushed.toolCalls[0].name, "healable");
+  assert.strictEqual(flushed.truncatedToolCall, false);
 
-  // Invalid JSON in tool call - flush drops it with warning, restores lead-in
   const parser3 = new StreamingToolParser();
   parser3.feed("Invalid <tool_call>NOT_JSON");
   const flushed2 = parser3.flush();
-  // Invalid JSON is dropped with a warning message, and "Invalid " lead-in is restored
-  assert.ok(
-    flushed2.text.includes("[WARNING:"),
-    "should include truncation warning",
-  );
-  assert.ok(flushed2.text.includes("Invalid "), "should restore lead-in text");
+  assert.strictEqual(flushed2.text, "");
   assert.strictEqual(flushed2.toolCalls.length, 0);
+  assert.strictEqual(flushed2.truncatedToolCall, true);
 });
 
 test("StreamingToolParser: robust parsing of malformed JSON", () => {

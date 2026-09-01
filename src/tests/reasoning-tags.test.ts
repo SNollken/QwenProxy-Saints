@@ -9,6 +9,7 @@ import assert from "node:assert";
 process.env.TEST_MOCK_QWEN_AUTH = "true";
 
 import { app } from "../api/server.js";
+import { normalizeCumulativeReasoningContent } from "../utils/reasoning-tags.ts";
 
 function setupFetchMock(
   handler: (url: string, init?: RequestInit) => Response | Promise<Response>,
@@ -36,6 +37,106 @@ function setupFetchMock(
     globalThis.fetch = originalFetch;
   };
 }
+
+function makeOrphanThinkResponse(): Response {
+  const contents = [
+    "ORPHAN_OK",
+    "ORPHAN_OK</thi",
+    "ORPHAN_OK</think>",
+    "ORPHAN_OK</think>\n\nORPHAN_OK",
+  ];
+  const stream = new ReadableStream({
+    start(c) {
+      for (const content of contents) {
+        c.enqueue(
+          new TextEncoder().encode(
+            `data: ${JSON.stringify({ choices: [{ delta: { phase: "answer", content } }] })}\n\n`,
+          ),
+        );
+      }
+      c.enqueue(new TextEncoder().encode("data: [DONE]\n\n"));
+      c.close();
+    },
+  });
+  return new Response(stream, { status: 200 });
+}
+
+test("cumulative normalizer suppresses split and duplicated orphan </think>", () => {
+  assert.deepStrictEqual(normalizeCumulativeReasoningContent("ORPHAN_OK"), {
+    content: "ORPHAN_OK",
+    detectedOrphanClose: false,
+  });
+  assert.deepStrictEqual(
+    normalizeCumulativeReasoningContent("ORPHAN_OK</thi"),
+    {
+      content: "ORPHAN_OK</thi",
+      detectedOrphanClose: false,
+    },
+  );
+  assert.deepStrictEqual(
+    normalizeCumulativeReasoningContent("ORPHAN_OK\n</think>\n\nORPHAN_OK"),
+    {
+      content: "ORPHAN_OK",
+      detectedOrphanClose: true,
+    },
+  );
+});
+
+test("non-stream: orphan </think> does not leak or duplicate content", async () => {
+  const restore = setupFetchMock(makeOrphanThinkResponse);
+
+  try {
+    const req = new Request("http://localhost/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "qwen3.6-plus",
+        messages: [{ role: "user", content: "test" }],
+        stream: false,
+      }),
+    });
+
+    const res = await app.fetch(req);
+    assert.strictEqual(res.status, 200);
+    const body = await res.json();
+    assert.strictEqual(body.choices[0].message.content, "ORPHAN_OK");
+    assert.ok(!body.choices[0].message.content.includes("</think>"));
+  } finally {
+    restore();
+  }
+});
+
+test("stream: orphan </think> does not leak or duplicate content", async () => {
+  const restore = setupFetchMock(makeOrphanThinkResponse);
+
+  try {
+    const req = new Request("http://localhost/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "qwen3.6-plus",
+        messages: [{ role: "user", content: "test" }],
+        stream: true,
+      }),
+    });
+
+    const res = await app.fetch(req);
+    assert.strictEqual(res.status, 200);
+    const payload = await res.text();
+    let content = "";
+
+    for (const line of payload.split("\n")) {
+      if (!line.startsWith("data: ") || line === "data: [DONE]") continue;
+      const delta = JSON.parse(line.slice(6)).choices?.[0]?.delta;
+      if (typeof delta?.content === "string") content += delta.content;
+    }
+
+    assert.strictEqual(content, "ORPHAN_OK");
+    assert.ok(!content.includes("</think>"));
+  } finally {
+    restore();
+  }
+});
 
 test("non-stream: leaked <think> tags are moved to reasoning_content", async () => {
   const restore = setupFetchMock(() => {
