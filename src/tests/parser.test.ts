@@ -141,6 +141,22 @@ test("StreamingToolParser: recovers tool_calling and deduplicates identical call
   assert.deepStrictEqual(result.toolCalls[0].arguments, { path: "a.txt" });
 });
 
+test("StreamingToolParser: recovers the tool_caller wrapper", () => {
+  const parser = new StreamingToolParser();
+  const first = parser.feed(
+    '<tool_caller>{"name":"terminal","arguments":{"command":"sha256sum package-lock.json"}}',
+  );
+  const second = parser.feed("</tool_caller>");
+
+  assert.strictEqual(first.toolCalls.length, 0);
+  assert.strictEqual(second.text, "");
+  assert.strictEqual(second.toolCalls.length, 1);
+  assert.strictEqual(second.toolCalls[0].name, "terminal");
+  assert.deepStrictEqual(second.toolCalls[0].arguments, {
+    command: "sha256sum package-lock.json",
+  });
+});
+
 test("StreamingToolParser: preserves ellipsis placeholders as ordinary text", () => {
   const parser = new StreamingToolParser(TOOLS);
   const first = parser.feed("<tool_call");

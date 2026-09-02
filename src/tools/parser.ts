@@ -46,6 +46,8 @@ interface ActiveIncrementalToolCall {
 const TOOL_END = "</" + "tool_call>";
 const TOOL_CALLING_START = "<tool_calling>";
 const TOOL_CALLING_END = "</tool_calling>";
+const TOOL_CALLER_START = "<tool_caller>";
+const TOOL_CALLER_END = "</tool_caller>";
 
 function normalizeToolNameForMatch(name: string): string {
   return name.toLowerCase().replace(/[^a-z0-9]/g, "");
@@ -134,7 +136,7 @@ function findNextToolOpenTagOutsideMarkdownCode(
       const match = buffer
         .substring(i)
         .match(
-          /^(?:<tool_calling>|<tool_call(?:[ \t]+[^>\r\n]*|[-_~!:][^>\r\n]*)?(?:>|\r?\n))/i,
+          /^(?:<tool_calling>|<tool_caller>|<tool_call(?:[ \t]+[^>\r\n]*|[-_~!:][^>\r\n]*)?(?:>|\r?\n))/i,
         );
       if (match) {
         return { index: i, openTag: match[0] };
@@ -148,9 +150,11 @@ function findNextToolOpenTagOutsideMarkdownCode(
 }
 
 function getToolCloseTag(openTag: string): string {
-  if (openTag.toLowerCase() === TOOL_CALLING_START) {
+  const normalizedOpenTag = openTag.toLowerCase();
+  if (normalizedOpenTag === TOOL_CALLING_START) {
     return TOOL_CALLING_END;
   }
+  if (normalizedOpenTag === TOOL_CALLER_START) return TOOL_CALLER_END;
   const namedMatch = openTag.match(/^<tool_call_([a-z0-9_-]+)>$/i);
   return namedMatch ? `</tool_call_${namedMatch[1]}>` : TOOL_END;
 }
@@ -180,6 +184,7 @@ function findPartialToolOpenIndexOutsideMarkdownCode(
   let delimiterLength = initialDelimiterLength;
   const lowerToolStart = TOOL_START_LITERAL.toLowerCase();
   const lowerToolCallingStart = TOOL_CALLING_START.toLowerCase();
+  const lowerToolCallerStart = TOOL_CALLER_START.toLowerCase();
 
   for (let i = 0; i < buffer.length;) {
     if (buffer[i] === "`") {
@@ -212,6 +217,9 @@ function findPartialToolOpenIndexOutsideMarkdownCode(
         return i;
       }
       if (lowerToolCallingStart.startsWith(tailLower)) {
+        return i;
+      }
+      if (lowerToolCallerStart.startsWith(tailLower)) {
         return i;
       }
     }
