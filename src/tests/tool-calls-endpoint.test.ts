@@ -550,6 +550,61 @@ test("stream: fragmented named wrapper with direct arguments becomes tool_search
   }
 });
 
+test("stream: Qwen native control tokens become a structured tool call", async () => {
+  const restore = setupFetchMock(() =>
+    createSseResponse([
+      `data: ${JSON.stringify({
+        choices: [
+          {
+            delta: {
+              phase: "answer",
+              content: "<tool_call_calls_section_",
+            },
+          },
+        ],
+      })}`,
+      `data: ${JSON.stringify({
+        choices: [
+          {
+            delta: {
+              phase: "answer",
+              content:
+                'begin|><tool_call_begin|>read_file<|tool_call_argument_begin|>{"path":"handoff.md"}\n</tool_call_end|>\n</tool_calls_section_end|>',
+            },
+          },
+        ],
+      })}`,
+    ]),
+  );
+
+  try {
+    const req = new Request("http://localhost/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "qwen3.6-plus",
+        stream: true,
+        tools: TOOLS,
+        messages: [{ role: "user", content: "read the handoff" }],
+      }),
+    });
+
+    const res = await app.fetch(req);
+    assert.strictEqual(res.status, 200);
+
+    const result = await collectStreamResult(res);
+    assert.strictEqual(result.content, "");
+    assert.strictEqual(result.toolCalls.length, 1);
+    assert.strictEqual(result.toolCalls[0].name, "read_file");
+    assert.deepStrictEqual(JSON.parse(result.toolCalls[0].arguments), {
+      path: "handoff.md",
+    });
+    assert.strictEqual(result.finishReason, "tool_calls");
+  } finally {
+    restore();
+  }
+});
+
 test("stream: write_file arguments are emitted once after tool close", async () => {
   const content1 =
     '<tool_call>{"name":"write_file","arguments":{"path":"index.html","content":"<h1';

@@ -154,6 +154,115 @@ test("StreamingToolParser: holds a fragmented named wrapper until it is complete
   });
 });
 
+test("StreamingToolParser: parses Qwen native tool control tokens", () => {
+  const parser = new StreamingToolParser(TOOLS);
+  const result = parser.feed(
+    '<tool_call_calls_section_begin|><tool_call_begin|>read_file<|tool_call_argument_begin|>{"path":"handoff.md"}\n</tool_call_end|>\n</tool_calls_section_end|>',
+  );
+  const flushed = parser.flush();
+
+  assert.strictEqual(result.text, "");
+  assert.strictEqual(result.toolCalls.length, 1);
+  assert.strictEqual(result.toolCalls[0].name, "read_file");
+  assert.deepStrictEqual(result.toolCalls[0].arguments, {
+    path: "handoff.md",
+  });
+  assert.strictEqual(flushed.text, "");
+  assert.strictEqual(flushed.toolCalls.length, 0);
+  assert.strictEqual(flushed.truncatedToolCall, false);
+});
+
+test("StreamingToolParser: parses fragmented Qwen native tool control tokens", () => {
+  const parser = new StreamingToolParser(TOOLS);
+  const chunks = [
+    "<tool_call_calls_section_",
+    "begin|><tool_call_begin|>read_",
+    'file<|tool_call_argument_begin|>{"path":"handoff.md"}',
+    "\n</tool_call_",
+    "end|>\n</tool_calls_section_",
+    "end|>",
+  ];
+
+  const results = chunks.map((chunk) => parser.feed(chunk));
+  const flushed = parser.flush();
+  const text = results.map((result) => result.text).join("") + flushed.text;
+  const toolCalls = results.flatMap((result) => result.toolCalls);
+
+  assert.strictEqual(text, "");
+  assert.strictEqual(toolCalls.length, 1);
+  assert.strictEqual(toolCalls[0].name, "read_file");
+  assert.deepStrictEqual(toolCalls[0].arguments, { path: "handoff.md" });
+  assert.strictEqual(flushed.truncatedToolCall, false);
+});
+
+test("StreamingToolParser: recovers a pipe opener and slash closer before simulated results", () => {
+  const parser = new StreamingToolParser(TOOL_SEARCH_TOOLS);
+  const chunks = [
+    "<tool_call|",
+    '\n{"name":"tool_search","arguments":{"queries":["read file"]}}',
+    "\n</tool_call/>",
+    '<tool_call_result>{"result":"invented result"}</tool_call_result>',
+    "I read a file without waiting for the tool.",
+  ];
+  const results = [...chunks.map((chunk) => parser.feed(chunk)), parser.flush()];
+
+  assert.strictEqual(results.map((result) => result.text).join(""), "");
+  const calls = results.flatMap((result) => result.toolCalls);
+  assert.strictEqual(calls.length, 1);
+  assert.strictEqual(calls[0].name, "tool_search");
+  assert.deepStrictEqual(calls[0].arguments, { queries: ["read file"] });
+  assert.ok(results.every((result) => !result.truncatedToolCall));
+});
+
+test("StreamingToolParser: handles multiple native calls and the unslashed section end", () => {
+  const parser = new StreamingToolParser(TOOLS);
+  const result = parser.feed(
+    '<tool_call_calls_section_begin|><tool_call_begin|>read_file<|tool_call_argument_begin|>{"path":"first.md"}</tool_call_end|>' +
+      '<tool_call_begin|>read_file<|tool_call_argument_begin|>{"path":"second.md"}</tool_call_end|><tool_calls_section_end|>',
+  );
+
+  assert.strictEqual(result.text, "");
+  assert.deepStrictEqual(
+    result.toolCalls.map((call) => [call.name, call.arguments]),
+    [
+      ["read_file", { path: "first.md" }],
+      ["read_file", { path: "second.md" }],
+    ],
+  );
+  assert.strictEqual(parser.flush().truncatedToolCall, false);
+});
+
+test("StreamingToolParser: never invokes undeclared Qwen native tools", () => {
+  const parser = new StreamingToolParser(TOOLS);
+  const result = parser.feed(
+    '<tool_call_calls_section_begin|><tool_call_begin|>delete_everything<|tool_call_argument_begin|>{"path":"/"}\n</tool_call_end|>\n</tool_calls_section_end|>',
+  );
+  const flushed = parser.flush();
+
+  assert.strictEqual(result.text + flushed.text, "");
+  assert.strictEqual(result.toolCalls.length + flushed.toolCalls.length, 0);
+});
+
+test("StreamingToolParser: never reinterprets undeclared native arguments as a call", () => {
+  const parser = new StreamingToolParser(TOOLS);
+  const result = parser.feed(
+    '<tool_call_begin|>unknown<|tool_call_argument_begin|>{"name":"read_file","arguments":{"path":"private.md"}}</tool_call_end|>',
+  );
+
+  assert.strictEqual(result.text, "");
+  assert.strictEqual(result.toolCalls.length, 0);
+});
+
+test("StreamingToolParser: preserves native control tokens inside Markdown code", () => {
+  const parser = new StreamingToolParser(TOOLS);
+  const literal = "`</tool_calls_section_end|>`";
+
+  const result = parser.feed(literal);
+
+  assert.strictEqual(result.text, literal);
+  assert.strictEqual(result.toolCalls.length, 0);
+});
+
 test("StreamingToolParser: recovers direct arguments from a named closing wrapper", () => {
   const parser = new StreamingToolParser(TOOL_SEARCH_TOOLS);
   const result = parser.feed(

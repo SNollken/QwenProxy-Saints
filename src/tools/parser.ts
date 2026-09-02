@@ -49,6 +49,12 @@ const TOOL_CALLING_START = "<tool_calling>";
 const TOOL_CALLING_END = "</tool_calling>";
 const TOOL_CALLER_START = "<tool_caller>";
 const TOOL_CALLER_END = "</tool_caller>";
+const QWEN_NATIVE_TOOL_BEGIN = "<tool_call_begin|>";
+const QWEN_NATIVE_ARGUMENT_BEGIN = "<|tool_call_argument_begin|>";
+const QWEN_NATIVE_SECTION_END_TAGS = [
+  "</tool_calls_section_end|>",
+  "<tool_calls_section_end|>",
+];
 
 function normalizeToolNameForMatch(name: string): string {
   return name.toLowerCase().replace(/[^a-z0-9]/g, "");
@@ -137,7 +143,7 @@ function findNextToolOpenTagOutsideMarkdownCode(
       const match = buffer
         .substring(i)
         .match(
-          /^(?:<tool_calling>|<tool_caller>|<tool_call(?:[ \t]+[^>\r\n]*|[-_~!:][^>\r\n]*)?(?:>|\r?\n))/i,
+          /^(?:<tool_calling>|<tool_caller>|<tool_call(?:[ \t]+[^>\r\n]*|[-_~!:|][^>\r\n]*)?(?:>|\r?\n))/i,
         );
       if (match) {
         return { index: i, openTag: match[0] };
@@ -186,6 +192,83 @@ function findCorruptNestedToolMarkerOutsideMarkdownCode(
   return null;
 }
 
+function findQwenNativeSectionEndOutsideMarkdownCode(
+  buffer: string,
+  initialDelimiterLength = 0,
+): { index: number; tag: string } | null {
+  let delimiterLength = initialDelimiterLength;
+
+  for (let i = 0; i < buffer.length;) {
+    if (buffer[i] === "`") {
+      let runLength = 1;
+      while (i + runLength < buffer.length && buffer[i + runLength] === "`") {
+        runLength++;
+      }
+
+      if (delimiterLength === 0) {
+        delimiterLength = runLength;
+      } else if (runLength >= delimiterLength) {
+        delimiterLength = 0;
+      }
+
+      i += runLength;
+      continue;
+    }
+
+    if (delimiterLength === 0 && buffer[i] === "<") {
+      const tailLower = buffer.substring(i).toLowerCase();
+      const tag = QWEN_NATIVE_SECTION_END_TAGS.find((candidate) =>
+        tailLower.startsWith(candidate),
+      );
+      if (tag) return { index: i, tag };
+    }
+
+    i++;
+  }
+
+  return null;
+}
+
+function findPartialQwenNativeSectionEndIndexOutsideMarkdownCode(
+  buffer: string,
+  initialDelimiterLength = 0,
+): number {
+  let delimiterLength = initialDelimiterLength;
+
+  for (let i = 0; i < buffer.length;) {
+    if (buffer[i] === "`") {
+      let runLength = 1;
+      while (i + runLength < buffer.length && buffer[i + runLength] === "`") {
+        runLength++;
+      }
+
+      if (delimiterLength === 0) {
+        delimiterLength = runLength;
+      } else if (runLength >= delimiterLength) {
+        delimiterLength = 0;
+      }
+
+      i += runLength;
+      continue;
+    }
+
+    if (delimiterLength === 0 && buffer[i] === "<") {
+      const tailLower = buffer.substring(i).toLowerCase();
+      if (
+        QWEN_NATIVE_SECTION_END_TAGS.some((tag) =>
+          tag.startsWith(tailLower),
+        )
+      ) {
+        return i;
+      }
+    }
+
+    i++;
+  }
+
+  return -1;
+}
+
 function getToolCloseTag(openTag: string): string {
   const normalizedOpenTag = openTag.toLowerCase();
   if (normalizedOpenTag === TOOL_CALLING_START) {
@@ -215,7 +298,7 @@ function findToolCloseTag(
   }
 
   const malformedMatch = buffer.match(
-    /<\/tool_call(?:[ \t]+[^>\r\n]*|[-_~!:][^>\r\n]*)?(?:>|\r?\n)/i,
+    /<\/tool_call(?:[ \t]+[^>\r\n]*|[-_~!:|/][^>\r\n]*)?(?:>|\r?\n)/i,
   );
   return malformedMatch?.index === undefined
     ? null
@@ -275,7 +358,7 @@ function findPartialToolOpenIndexOutsideMarkdownCode(
         const suffix = tailLower.substring(lowerToolCallPrefix.length);
         if (
           suffix.length === 0 ||
-          (/^[\s_~!:\-]/.test(suffix) && !suffix.includes(">"))
+          (/^[\s_~!:|\-]/.test(suffix) && !suffix.includes(">"))
         ) {
           return i;
         }
@@ -1003,6 +1086,58 @@ export class StreamingToolParser {
     };
   }
 
+  private isQwenNativeToolCall(content: string): boolean {
+    return (
+      /^<tool_call_(?:calls_section_begin|begin)\|>$/i.test(this.currentOpenTag) ||
+      content.trimStart().toLowerCase().startsWith(QWEN_NATIVE_TOOL_BEGIN)
+    );
+  }
+
+  private tryParseQwenNativeToolCall(content: string): ParsedToolCall | null {
+    if (this.declaredToolNameSet.size === 0) return null;
+    let nativeContent = content.trim();
+    if (
+      nativeContent
+        .toLowerCase()
+        .startsWith(QWEN_NATIVE_TOOL_BEGIN.toLowerCase())
+    ) {
+      nativeContent = nativeContent.substring(QWEN_NATIVE_TOOL_BEGIN.length);
+    }
+
+    const argumentMarkerIndex = nativeContent
+      .toLowerCase()
+      .indexOf(QWEN_NATIVE_ARGUMENT_BEGIN.toLowerCase());
+    if (argumentMarkerIndex <= 0) return null;
+
+    const emittedName = nativeContent
+      .substring(0, argumentMarkerIndex)
+      .trim();
+    const toolName = this.resolveDeclaredToolName(emittedName);
+    if (!toolName) return null;
+
+    const parsedArguments = parseJsonishString(
+      nativeContent.substring(
+        argumentMarkerIndex + QWEN_NATIVE_ARGUMENT_BEGIN.length,
+      ),
+    );
+    if (
+      !parsedArguments ||
+      typeof parsedArguments !== "object" ||
+      Array.isArray(parsedArguments)
+    ) {
+      return null;
+    }
+
+    return {
+      id: `call_${crypto.randomUUID()}`,
+      name: toolName,
+      arguments: this.normalizeArgumentsForTool(
+        toolName,
+        parsedArguments as Record<string, unknown>,
+      ),
+    };
+  }
+
   private normalizeArgumentsForTool(
     name: string,
     args: Record<string, unknown>,
@@ -1281,13 +1416,20 @@ export class StreamingToolParser {
             this.buffer,
             this.markdownCodeDelimiterLength,
           );
+        const nativeSectionEnd =
+          findQwenNativeSectionEndOutsideMarkdownCode(
+            this.buffer,
+            this.markdownCodeDelimiterLength,
+          );
         const match = findNextToolOpenTagOutsideMarkdownCode(
           this.buffer,
           this.markdownCodeDelimiterLength,
         );
         if (
           corruptNestedMarker &&
-          (!match || corruptNestedMarker.index <= match.index)
+          (!match || corruptNestedMarker.index <= match.index) &&
+          (!nativeSectionEnd ||
+            corruptNestedMarker.index <= nativeSectionEnd.index)
         ) {
           this.emitVisibleText(
             result,
@@ -1299,6 +1441,18 @@ export class StreamingToolParser {
           this.buffer = "";
           this.suppressMalformedToolSyntax = true;
           break;
+        } else if (
+          nativeSectionEnd &&
+          (!match || nativeSectionEnd.index <= match.index)
+        ) {
+          const textBefore = this.buffer.substring(0, nativeSectionEnd.index);
+          if (textBefore.trim().length > 0) {
+            this.emitVisibleText(result, textBefore);
+          }
+          this.buffer = this.buffer.substring(
+            nativeSectionEnd.index + nativeSectionEnd.tag.length,
+          );
+          continue;
         } else if (match) {
           // Text before the tool call tag
           const textBefore = this.buffer.substring(0, match.index);
@@ -1358,12 +1512,20 @@ export class StreamingToolParser {
             this.buffer,
             this.markdownCodeDelimiterLength,
           );
+          const partialNativeSectionEndIdx =
+            findPartialQwenNativeSectionEndIndexOutsideMarkdownCode(
+              this.buffer,
+              this.markdownCodeDelimiterLength,
+            );
+          const partialCandidates = [
+            partialMissingOpenIdx,
+            partialOpenIdx,
+            partialNativeSectionEndIdx,
+          ].filter((index) => index !== -1);
           const partialIdx =
-            partialMissingOpenIdx === -1
-              ? partialOpenIdx
-              : partialOpenIdx === -1
-                ? partialMissingOpenIdx
-                : Math.min(partialMissingOpenIdx, partialOpenIdx);
+            partialCandidates.length === 0
+              ? -1
+              : Math.min(...partialCandidates);
           const flushIndex =
             partialIdx === -1 ? this.buffer.length : partialIdx;
           if (flushIndex > 0) {
@@ -1504,7 +1666,33 @@ export class StreamingToolParser {
         this.buffer,
         this.markdownCodeDelimiterLength,
       );
-      if (partialOpenIndex !== -1) {
+      const partialNativeSectionEndIndex =
+        findPartialQwenNativeSectionEndIndexOutsideMarkdownCode(
+          this.buffer,
+          this.markdownCodeDelimiterLength,
+        );
+      if (
+        partialNativeSectionEndIndex !== -1 &&
+        /^<\/?tool_calls_section_/i.test(
+          this.buffer.substring(partialNativeSectionEndIndex),
+        ) &&
+        (partialOpenIndex === -1 ||
+          partialNativeSectionEndIndex < partialOpenIndex)
+      ) {
+        this.emitVisibleText(
+          result,
+          this.buffer.substring(0, partialNativeSectionEndIndex),
+        );
+        logger.warn(
+          "[parser] Dropping partial Qwen native section-end token at end of stream",
+          {
+            bufferPreview: this.buffer.substring(
+              partialNativeSectionEndIndex,
+              500,
+            ),
+          },
+        );
+      } else if (partialOpenIndex !== -1) {
         this.emitVisibleText(
           result,
           this.buffer.substring(0, partialOpenIndex),
@@ -1590,6 +1778,18 @@ export class StreamingToolParser {
           t.includes("<parameter"),
         openTag: this.currentOpenTag,
       });
+    }
+
+    if (this.isQwenNativeToolCall(t)) {
+      const nativeCall = this.tryParseQwenNativeToolCall(t);
+      if (nativeCall) {
+        this.finalizeSuccessfulToolCall(nativeCall, result);
+      } else {
+        logger.warn("[parser] Dropping invalid or undeclared Qwen native tool call");
+        this.emitVisibleText(result, this.pendingLeadIn);
+        this.pendingLeadIn = "";
+      }
+      return;
     }
 
     // 1) Try Hermes-style XML <parameter> format first
@@ -1801,6 +2001,10 @@ export class StreamingToolParser {
         blockLength: block.length,
         blockPreview: block.substring(0, 300),
       });
+    }
+
+    if (this.isQwenNativeToolCall(block)) {
+      return this.tryParseQwenNativeToolCall(block);
     }
 
     const namedWrapperParsed = this.tryParseNamedWrapperArguments(block);
