@@ -649,12 +649,14 @@ export async function syncQwenRequestPersonalization(
     sessionId?: string | null;
     promptChars?: number;
   } = {},
+  signal?: AbortSignal,
 ): Promise<void> {
+  signal?.throwIfAborted();
   if (isAuthMockEnabled()) return;
   if (!instruction.trim()) return;
 
   const cacheKey = accountId || "global";
-  const { headers } = await getQwenHeaders(false, accountId);
+  const { headers } = await getQwenHeaders(false, accountId, signal);
   const requestHeaders = buildCapturedQwenHeaders(headers, {
     referer: `${config.qwen.baseUrl}/settings/personalization`,
   });
@@ -694,6 +696,7 @@ export async function syncQwenRequestPersonalization(
         {
           method: "GET",
           headers: requestHeaders,
+          signal,
         },
       );
       const { json: existingJson } =
@@ -732,6 +735,7 @@ export async function syncQwenRequestPersonalization(
         return;
       }
     } catch (err) {
+      signal?.throwIfAborted();
       logger.debug("[Qwen] personalization pre-check failed; updating anyway", {
         accountId: cacheKey,
         error: err instanceof Error ? err.message : String(err),
@@ -752,6 +756,7 @@ export async function syncQwenRequestPersonalization(
             headers: buildCapturedQwenHeaders(headers, {
               referer: `${config.qwen.baseUrl}/settings/personalization`,
             }),
+            signal,
           },
         );
         const { json: settingsJson } =
@@ -759,6 +764,7 @@ export async function syncQwenRequestPersonalization(
         currentSettings = settingsJson?.data ?? null;
         payload = buildQwenSettingsUpdatePayload(currentSettings, instruction);
       } catch (err) {
+        signal?.throwIfAborted();
         logger.debug(
           "[Qwen] settings GET before update failed; using safe partial payload",
           {
@@ -778,6 +784,7 @@ export async function syncQwenRequestPersonalization(
         method: "POST",
         headers: reqHeaders,
         body: JSON.stringify(payload),
+        signal,
       },
     );
     return readJsonTextResponse(resp);
@@ -802,9 +809,14 @@ export async function syncQwenRequestPersonalization(
       `[Qwen] Personalization 401 — refreshing session and retrying | account=${cacheKey}`,
     );
     try {
-      const { headers: freshHeaders } = await getQwenHeaders(true, accountId);
+      const { headers: freshHeaders } = await getQwenHeaders(
+        true,
+        accountId,
+        signal,
+      );
       ({ raw, json } = await attemptPost(freshHeaders));
     } catch (retryErr) {
+      signal?.throwIfAborted();
       // Layer 3: Retry failed → non-fatal, continue without personalization
       console.warn(
         `[Qwen] Personalization retry failed, continuing without it | account=${cacheKey} | error=${(retryErr as Error).message?.substring(0, 150)}`,
@@ -833,6 +845,7 @@ export async function syncQwenRequestPersonalization(
       {
         method: "GET",
         headers: requestHeaders,
+        signal,
       },
     );
     const { json: verifyJson } = await readJsonTextResponse(verifyResponse);
@@ -1114,15 +1127,33 @@ export interface QwenFileEntry {
   [key: string]: any;
 }
 
+function forwardAbortSignal(
+  source: AbortSignal | undefined,
+  controller: AbortController,
+): () => void {
+  if (!source) return () => {};
+
+  const abort = () => controller.abort(source.reason);
+  if (source.aborted) {
+    abort();
+  } else {
+    source.addEventListener("abort", abort, { once: true });
+  }
+  return () => source.removeEventListener("abort", abort);
+}
+
 async function createQwenChatSession(
   headers: Record<string, string>,
   model: string,
+  signal?: AbortSignal,
 ): Promise<string> {
+  signal?.throwIfAborted();
   if (isAuthMockEnabled()) {
     return process.env.TEST_SESSION_ID || "mock-session";
   }
 
   const controller = new AbortController();
+  const detachSourceAbort = forwardAbortSignal(signal, controller);
   const timeoutId = setTimeout(() => controller.abort(), config.timeouts.http);
 
   try {
@@ -1171,6 +1202,7 @@ async function createQwenChatSession(
     return chatId;
   } finally {
     clearTimeout(timeoutId);
+    detachSourceAbort();
   }
 }
 
@@ -1278,7 +1310,9 @@ async function acquireNewQwenChatSession(
   headers: Record<string, string>,
   model: string,
   accountId?: string,
+  signal?: AbortSignal,
 ): Promise<{ chatId: string; leasedFromPool: boolean }> {
+  signal?.throwIfAborted();
   if (isQwenChatPoolEnabled()) {
     const key = chatPoolKey(accountId, model);
     const pooled = precreatedChatSessions.get(key);
@@ -1302,11 +1336,15 @@ async function acquireNewQwenChatSession(
       } else {
         void scheduleQwenChatPoolRefill(headers, model, accountId);
       }
+      if (signal?.aborted) {
+        releaseWarmChat(accountId, model, chatId);
+        signal.throwIfAborted();
+      }
       return { chatId, leasedFromPool: true };
     }
   }
 
-  const created = await createQwenChatSession(headers, model);
+  const created = await createQwenChatSession(headers, model, signal);
   logger.debug("[Qwen] created fresh chat", {
     accountId: accountId || "global",
     model,
@@ -1593,6 +1631,7 @@ export async function createQwenStream(
   options?: {
     chatSessionId?: string | null;
     forceNewChat?: boolean;
+    signal?: AbortSignal;
   },
 ): Promise<{
   stream: ReadableStream;
@@ -1603,12 +1642,14 @@ export async function createQwenStream(
   createdNewChat: boolean;
   tokenEstimationContext: TokenEstimationContext;
 }> {
+  options?.signal?.throwIfAborted();
   // A new logical chat session should reuse the warmed header cache when available.
   // Header recapture is much more expensive and should be reserved for real refresh/login cases,
   // not for ordinary first prompts that simply need parent_id reset.
   const captured = await getQwenHeaders(
     options?.forceNewChat === true,
     accountId,
+    options?.signal,
   );
   const { headers, parentMessageId } = captured;
   const model = modelId.replace("-no-thinking", "");
@@ -1621,6 +1662,7 @@ export async function createQwenStream(
         headers,
         model,
         accountId,
+        options.signal,
       );
       chatSessionId = acquired.chatId;
       leasedWarmChat = acquired.leasedFromPool;
@@ -1635,6 +1677,7 @@ export async function createQwenStream(
         headers,
         model,
         accountId,
+        options?.signal,
       );
       chatSessionId = acquired.chatId;
       leasedWarmChat = acquired.leasedFromPool;
@@ -1647,6 +1690,12 @@ export async function createQwenStream(
     if (!leasedWarmChat || warmChatReleased || !chatSessionId) return;
     warmChatReleased = true;
     releaseWarmChat(accountId, model, chatSessionId);
+  };
+  let detachSourceAbort = () => {};
+  const cleanupStream = () => {
+    releaseLeasedWarmChat();
+    detachSourceAbort();
+    detachSourceAbort = () => {};
   };
 
   const wrapUpstreamStream = (
@@ -1664,18 +1713,18 @@ export async function createQwenStream(
             if (!reader) throw new Error("Stream reader was not initialized");
             const { done, value } = await reader.read();
             if (done) {
-              releaseLeasedWarmChat();
+              cleanupStream();
               streamController.close();
               return;
             }
             streamController.enqueue(value);
           } catch (error) {
-            releaseLeasedWarmChat();
+            cleanupStream();
             streamController.error(error);
           }
         },
         cancel(reason) {
-          releaseLeasedWarmChat();
+          cleanupStream();
           return stream.cancel(reason);
         },
       });
@@ -1686,8 +1735,8 @@ export async function createQwenStream(
       controller,
       config.timeouts.idleStreamTimeout,
       `Qwen stream ${chatSessionId || "unknown"}`,
-      releaseLeasedWarmChat,
-      releaseLeasedWarmChat,
+      cleanupStream,
+      cleanupStream,
     );
   };
 
@@ -1802,6 +1851,7 @@ export async function createQwenStream(
     : `${config.qwen.baseUrl}/api/v2/chat/completions`;
 
   const controller = new AbortController();
+  detachSourceAbort = forwardAbortSignal(options?.signal, controller);
   const timeoutId = setTimeout(() => controller.abort(), dynamicTimeoutMs);
 
   try {
@@ -1928,7 +1978,7 @@ export async function createQwenStream(
       tokenEstimationContext,
     };
   } catch (error) {
-    releaseLeasedWarmChat();
+    cleanupStream();
     throw error;
   }
 }

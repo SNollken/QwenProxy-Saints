@@ -106,6 +106,7 @@ function formatTimingHeader(timings: Record<string, number>): string {
 
 export async function chatCompletions(c: Context) {
   let releaseChatLock: (() => void) | null = null;
+  const requestSignal = c.req.raw.signal;
   const startedAt = Date.now();
   const timings: Record<string, number> = {};
   const mark = (name: string, since: number) => {
@@ -113,6 +114,7 @@ export async function chatCompletions(c: Context) {
   };
 
   try {
+    requestSignal.throwIfAborted();
     let stepStartedAt = Date.now();
     const parsed = await parseRequestBody(c);
     mark("parse", stepStartedAt);
@@ -157,7 +159,7 @@ export async function chatCompletions(c: Context) {
       const existingThread = getLogicalThreadState(ctx.sessionId);
       const chatId = existingThread?.chatSessionId;
       if (chatId) {
-        releaseChatLock = await acquireChatLock(chatId);
+        releaseChatLock = await acquireChatLock(chatId, requestSignal);
       }
     }
     mark("lock", stepStartedAt);
@@ -251,6 +253,7 @@ export async function chatCompletions(c: Context) {
       fullMessageCount: parsed.messageCount,
       toolsCount: declaredTools.length || undefined,
       requestPersonalizationInstruction: ctx.requestPersonalizationInstruction,
+      signal: requestSignal,
     });
 
     // TMD retry: if all accounts failed with anti-bot, summarize/truncate and retry
@@ -266,6 +269,7 @@ export async function chatCompletions(c: Context) {
         systemPrompt,
         body.model,
       );
+      requestSignal.throwIfAborted();
       if (reducedPrompt && reducedPrompt.length < finalPrompt.length) {
         finalPrompt = reducedPrompt;
         streamResult = await acquireUpstreamStream({
@@ -287,6 +291,7 @@ export async function chatCompletions(c: Context) {
           toolsCount: declaredTools.length || undefined,
           requestPersonalizationInstruction:
             ctx.requestPersonalizationInstruction,
+          signal: requestSignal,
         });
       }
     }
@@ -433,6 +438,7 @@ export async function chatCompletions(c: Context) {
           ? await processStreamingResponse(currentParams)
           : await processNonStreamingResponse(currentParams);
       } catch (streamErr: any) {
+        requestSignal.throwIfAborted();
         // Only retry RetryableQwenStreamError (quota/anti-bot during stream)
         if (
           streamProcessingRetries > 0 &&
@@ -506,6 +512,7 @@ export async function chatCompletions(c: Context) {
             toolsCount: declaredTools.length || undefined,
             requestPersonalizationInstruction:
               ctx.requestPersonalizationInstruction,
+            signal: requestSignal,
           });
 
           if ("error" in newStreamResult) {
@@ -522,7 +529,7 @@ export async function chatCompletions(c: Context) {
             const existingThread = getLogicalThreadState(ctx.sessionId);
             const chatId = existingThread?.chatSessionId;
             if (chatId) {
-              releaseChatLock = await acquireChatLock(chatId);
+              releaseChatLock = await acquireChatLock(chatId, requestSignal);
             }
           }
 
@@ -562,6 +569,12 @@ export async function chatCompletions(c: Context) {
     if (releaseChatLock) {
       releaseChatLock();
       releaseChatLock = null;
+    }
+    if (requestSignal.aborted) {
+      logger.debug("[chat] request abandoned before response", {
+        elapsedMs: Date.now() - startedAt,
+      });
+      return new Response(null, { status: 499 });
     }
     return handleChatCompletionsError(c, err);
   } finally {

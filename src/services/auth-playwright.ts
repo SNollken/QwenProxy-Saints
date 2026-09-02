@@ -30,7 +30,11 @@ function isRunningUnderNodeTest(): boolean {
   );
 }
 
-async function ensurePlaywrightInitialized(accountId: string): Promise<void> {
+async function ensurePlaywrightInitialized(
+  accountId: string,
+  signal?: AbortSignal,
+): Promise<void> {
+  signal?.throwIfAborted();
   if (isPlaywrightInitialized(accountId)) return;
 
   if (isRunningUnderNodeTest()) {
@@ -46,16 +50,21 @@ async function ensurePlaywrightInitialized(accountId: string): Promise<void> {
     credentials,
     config.playwright.headless,
     config.playwright.browser,
+    signal,
   );
 }
 
-export async function getBasicHeaders(accountId?: string): Promise<{
+export async function getBasicHeaders(
+  accountId?: string,
+  signal?: AbortSignal,
+): Promise<{
   cookie: string;
   userAgent: string;
   bxV: string;
   bxUa: string;
   bxUmidtoken: string;
 }> {
+  signal?.throwIfAborted();
   if (isAuthMockEnabled()) {
     return {
       cookie: "token=mock",
@@ -73,16 +82,18 @@ export async function getBasicHeaders(accountId?: string): Promise<{
     );
   }
 
-  await ensurePlaywrightInitialized(resolvedAccountId);
-  return getPlaywrightBasicHeaders(resolvedAccountId);
+  await ensurePlaywrightInitialized(resolvedAccountId, signal);
+  return getPlaywrightBasicHeaders(resolvedAccountId, signal);
 }
 
 export async function getQwenHeaders(
   forceNew = false,
   accountId?: string,
+  signal?: AbortSignal,
 ): Promise<HeaderResult> {
+  signal?.throwIfAborted();
   if (isAuthMockEnabled()) {
-    const basic = await getBasicHeaders(accountId);
+    const basic = await getBasicHeaders(accountId, signal);
     return {
       headers: {
         cookie: basic.cookie,
@@ -103,13 +114,13 @@ export async function getQwenHeaders(
     );
   }
 
-  await ensurePlaywrightInitialized(resolvedAccountId);
+  await ensurePlaywrightInitialized(resolvedAccountId, signal);
 
   if (forceNew) {
-    await refreshHeaders(resolvedAccountId);
+    await refreshHeaders(resolvedAccountId, signal);
   }
 
-  const basic = await getPlaywrightBasicHeaders(resolvedAccountId);
+  const basic = await getPlaywrightBasicHeaders(resolvedAccountId, signal);
   return {
     headers: {
       cookie: basic.cookie,

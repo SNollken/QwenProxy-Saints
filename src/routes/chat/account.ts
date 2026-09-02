@@ -44,13 +44,16 @@ const chatLocks = new Map<string, Mutex>();
 // creation serialized per account when the experimental request-sync mode is used.
 const personalizationLocks = new Map<string, Mutex>();
 
-export async function acquireChatLock(chatId: string): Promise<() => void> {
+export async function acquireChatLock(
+  chatId: string,
+  signal?: AbortSignal,
+): Promise<() => void> {
   let mutex = chatLocks.get(chatId);
   if (!mutex) {
     mutex = new Mutex();
     chatLocks.set(chatId, mutex);
   }
-  const release = await mutex.acquire();
+  const release = await mutex.acquire(300_000, signal);
   return () => {
     release();
     if (mutex!.isIdle()) {
@@ -61,13 +64,14 @@ export async function acquireChatLock(chatId: string): Promise<() => void> {
 
 async function acquirePersonalizationLock(
   accountId: string,
+  signal?: AbortSignal,
 ): Promise<() => void> {
   let mutex = personalizationLocks.get(accountId);
   if (!mutex) {
     mutex = new Mutex();
     personalizationLocks.set(accountId, mutex);
   }
-  const release = await mutex.acquire();
+  const release = await mutex.acquire(300_000, signal);
   return () => {
     release();
     if (mutex!.isIdle()) {
@@ -118,6 +122,7 @@ export interface AcquireParams {
   fullMessageCount?: number;
   toolsCount?: number;
   requestPersonalizationInstruction?: string | null;
+  signal?: AbortSignal;
 }
 
 export function selectWarmAccount<T extends { id: string }>(
@@ -228,14 +233,16 @@ function isAntiBotError(err: any): boolean {
 async function attemptRelogin(
   accountId: string,
   accountEmail: string,
+  signal?: AbortSignal,
 ): Promise<boolean> {
   try {
-    await refreshHeaders(accountId);
+    await refreshHeaders(accountId, signal);
     console.log(
       `✅ [Chat] Playwright headers refreshed for ${maskEmail(accountEmail)}. Retrying...`,
     );
     return true;
   } catch (refreshErr: unknown) {
+    signal?.throwIfAborted();
     logger.error("[Chat] Playwright header refresh failed", {
       accountEmail: maskEmail(accountEmail),
       error:
@@ -249,9 +256,36 @@ async function attemptRelogin(
   return false;
 }
 
+function waitForRetry(delayMs: number, signal?: AbortSignal): Promise<void> {
+  signal?.throwIfAborted();
+  if (!signal) {
+    return new Promise((resolve) => setTimeout(resolve, delayMs));
+  }
+
+  return new Promise((resolve, reject) => {
+    const finish = () => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", abort);
+    };
+    const abort = () => {
+      finish();
+      reject(
+        signal.reason ?? new DOMException("The operation was aborted", "AbortError"),
+      );
+    };
+    const timer = setTimeout(() => {
+      finish();
+      resolve();
+    }, delayMs);
+    signal.addEventListener("abort", abort, { once: true });
+    if (signal.aborted) abort();
+  });
+}
+
 export async function acquireUpstreamStream(
   params: AcquireParams,
 ): Promise<StreamCreationResult | StreamCreationFailure> {
+  params.signal?.throwIfAborted();
   const {
     finalPrompt,
     isThinkingModel,
@@ -285,6 +319,7 @@ export async function acquireUpstreamStream(
   let verifiedPersistedCooldown = false;
 
   while (account) {
+    params.signal?.throwIfAborted();
     const accountId = account.id;
     const accountEmail = maskEmail(account.email);
 
@@ -405,12 +440,14 @@ export async function acquireUpstreamStream(
           requestPersonalizationInstruction:
             params.requestPersonalizationInstruction,
           fullPrompt: params.fullPrompt,
+          signal: params.signal,
         },
         accountId,
         accountEmail,
       );
 
       if (result.success) {
+        params.signal?.throwIfAborted();
         registerStream(completionId, {
           abortController: result.controller,
           accountId: result.accountId,
@@ -437,6 +474,7 @@ export async function acquireUpstreamStream(
 
       lastError = result.error;
     } catch (err: any) {
+      params.signal?.throwIfAborted();
       lastError = err;
     }
 
@@ -494,6 +532,7 @@ export async function acquireUpstreamStream(
     config.accountCreator.enabled &&
     (configuredAccounts.length === 0 || allConfiguredOnCooldown)
   ) {
+    params.signal?.throwIfAborted();
     const trigger =
       configuredAccounts.length === 0 ? "no-accounts" : "all-cooldown";
     console.warn(
@@ -501,6 +540,7 @@ export async function acquireUpstreamStream(
     );
     try {
       const created = await ensureAccountForRateLimit(trigger);
+      params.signal?.throwIfAborted();
       if (created.accountId) {
         const credentials = getAccountCredentials(created.accountId);
         if (credentials) {
@@ -525,6 +565,7 @@ export async function acquireUpstreamStream(
               requestPersonalizationInstruction:
                 params.requestPersonalizationInstruction,
               fullPrompt: params.fullPrompt,
+              signal: params.signal,
             },
             credentials.id,
             maskEmail(credentials.email),
@@ -560,6 +601,7 @@ export async function acquireUpstreamStream(
         );
       }
     } catch (autoErr) {
+      params.signal?.throwIfAborted();
       console.error(
         `❌ [Chat] Auto-create falhou:`,
         autoErr instanceof Error ? autoErr.message : String(autoErr),
@@ -635,6 +677,7 @@ async function tryCreateStreamWithRetry(
     fullMessageCount?: number;
     toolsCount?: number;
     requestPersonalizationInstruction?: string | null;
+    signal?: AbortSignal;
   },
   accountId: string,
   accountEmail: string,
@@ -647,6 +690,7 @@ async function tryCreateStreamWithRetry(
   const isSingleAccount = accounts.length <= 1;
 
   while (retries > 0) {
+    params.signal?.throwIfAborted();
     attempt++;
     if (attempt > 1) {
       console.log(
@@ -664,7 +708,7 @@ async function tryCreateStreamWithRetry(
           ? null
           : undefined;
       const releasePersonalization = params.requestPersonalizationInstruction
-        ? await acquirePersonalizationLock(accountId)
+        ? await acquirePersonalizationLock(accountId, params.signal)
         : null;
       let result: Awaited<ReturnType<typeof createQwenStream>>;
       try {
@@ -678,6 +722,7 @@ async function tryCreateStreamWithRetry(
               sessionId: params.sessionId,
               promptChars: params.finalPrompt.length,
             },
+            params.signal,
           );
         }
 
@@ -688,14 +733,17 @@ async function tryCreateStreamWithRetry(
           threadParentId,
           accountId === "global" ? undefined : accountId,
           params.allFiles.length > 0 ? params.allFiles : undefined,
-          params.forceNewChat || params.useThreadNative
-            ? {
-                chatSessionId: params.forceNewChat
-                  ? null
-                  : (params.existingThread?.chatSessionId ?? null),
-                forceNewChat: false,
-              }
-            : undefined,
+          {
+            signal: params.signal,
+            ...(params.forceNewChat || params.useThreadNative
+              ? {
+                  chatSessionId: params.forceNewChat
+                    ? null
+                    : (params.existingThread?.chatSessionId ?? null),
+                  forceNewChat: false,
+                }
+              : {}),
+          },
         );
       } finally {
         releasePersonalization?.();
@@ -737,6 +785,8 @@ async function tryCreateStreamWithRetry(
     } catch (err: any) {
       attemptError = err;
     }
+
+    params.signal?.throwIfAborted();
 
     retries--;
     const err = attemptError;
@@ -790,7 +840,11 @@ async function tryCreateStreamWithRetry(
       console.warn(
         `🔄 [Chat] Session expired for ${accountEmail} (${accountId}). Attempting re-login...`,
       );
-      const reLoginOk = await attemptRelogin(accountId, accountEmail);
+      const reLoginOk = await attemptRelogin(
+        accountId,
+        accountEmail,
+        params.signal,
+      );
       if (reLoginOk) continue;
       return { success: false, error: err };
     }
@@ -807,9 +861,7 @@ async function tryCreateStreamWithRetry(
         console.warn(
           `🔄 [Chat] Single account mode | Retrying in ${config.retry.baseDelayMs}ms...`,
         );
-        await new Promise((resolve) =>
-          setTimeout(resolve, config.retry.baseDelayMs),
-        );
+        await waitForRetry(config.retry.baseDelayMs, params.signal);
         continue;
       }
 
@@ -864,8 +916,9 @@ async function tryCreateStreamWithRetry(
         parentId: null,
         instructionsSent: false,
       });
-      await new Promise((resolve) =>
-        setTimeout(resolve, Math.min(config.retry.baseDelayMs, 2000)),
+      await waitForRetry(
+        Math.min(config.retry.baseDelayMs, 2000),
+        params.signal,
       );
       continue;
     }
@@ -965,7 +1018,7 @@ async function tryCreateStreamWithRetry(
     console.warn(
       `🔄 [Chat] Qwen request failed for ${accountEmail}, retrying in ${useDelay}ms... (${retries} left). Error: ${err.message?.slice(0, 200) || err}`,
     );
-    await new Promise((r) => setTimeout(r, useDelay));
+    await waitForRetry(useDelay, params.signal);
     retryDelay = Math.min(retryDelay * 2, config.retry.maxDelayMs);
   }
 

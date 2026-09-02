@@ -300,21 +300,26 @@ export async function getCookies(accountId: string): Promise<string> {
   return cookieStr;
 }
 
-export async function getBasicHeaders(accountId: string): Promise<{
+export async function getBasicHeaders(
+  accountId: string,
+  signal?: AbortSignal,
+): Promise<{
   cookie: string;
   userAgent: string;
   bxV: string;
   bxUa: string;
   bxUmidtoken: string;
 }> {
+  signal?.throwIfAborted();
   const page = accountPages.get(accountId);
   if (!page) {
     throw new Error(`Playwright not initialized for account: ${accountId}`);
   }
 
   // Acquire mutex to prevent concurrent browser access
-  const release = await getAccountMutex(accountId).acquire();
+  const release = await getAccountMutex(accountId).acquire(300_000, signal);
   try {
+    signal?.throwIfAborted();
     touchAccountActivity(accountId);
     // Get real user agent from browser
     let userAgent = config.auth.userAgent;
@@ -332,6 +337,7 @@ export async function getBasicHeaders(accountId: string): Promise<{
 
     const cookie = await getCookies(accountId);
 
+    signal?.throwIfAborted();
     touchAccountActivity(accountId);
     return {
       cookie,
@@ -349,7 +355,9 @@ export async function initPlaywrightForAccount(
   account: QwenAccount,
   headless = true,
   browserType: BrowserType = "chromium",
+  signal?: AbortSignal,
 ): Promise<void> {
+  signal?.throwIfAborted();
   if (accountPages.has(account.id)) {
     console.log(
       `[Playwright] Already initialized for ${maskEmail(account.email)}`,
@@ -357,8 +365,9 @@ export async function initPlaywrightForAccount(
     return;
   }
 
-  const release = await getAccountMutex(account.id).acquire();
+  const release = await getAccountMutex(account.id).acquire(300_000, signal);
   try {
+    signal?.throwIfAborted();
     // Double-check after acquiring lock
     if (accountPages.has(account.id)) {
       console.log(
@@ -468,6 +477,7 @@ export async function initPlaywrightForAccount(
       cleanupPlaywrightAccountState(account.id);
       throw error;
     }
+    signal?.throwIfAborted();
   } finally {
     release();
   }
@@ -821,10 +831,16 @@ async function refreshHeadersInternal(accountId: string): Promise<void> {
   }
 }
 
-export async function refreshHeaders(accountId: string): Promise<void> {
-  const release = await getAccountMutex(accountId).acquire();
+export async function refreshHeaders(
+  accountId: string,
+  signal?: AbortSignal,
+): Promise<void> {
+  signal?.throwIfAborted();
+  const release = await getAccountMutex(accountId).acquire(300_000, signal);
   try {
+    signal?.throwIfAborted();
     await refreshHeadersInternal(accountId);
+    signal?.throwIfAborted();
   } finally {
     release();
   }
