@@ -1,4 +1,5 @@
 import { EventEmitter } from 'events'
+import { getHeapStatistics } from 'node:v8'
 import { config } from './config.js'
 import { metrics } from './metrics.js'
 
@@ -6,6 +7,18 @@ interface HealthStatus {
   ram: 'ok' | 'warning' | 'critical'
   streams: 'ok' | 'congested' | 'blocked'
   overall: 'healthy' | 'degraded' | 'unhealthy'
+}
+
+export function classifyHeapUsage(
+  heapUsed: number,
+  heapSizeLimit: number,
+  warningThreshold: number,
+  criticalThreshold: number,
+): HealthStatus['ram'] {
+  const usagePercent = (heapUsed / heapSizeLimit) * 100
+  if (usagePercent > criticalThreshold) return 'critical'
+  if (usagePercent > warningThreshold) return 'warning'
+  return 'ok'
 }
 
 export class Watchdog extends EventEmitter {
@@ -51,11 +64,12 @@ export class Watchdog extends EventEmitter {
 
   private checkRAM(): 'ok' | 'warning' | 'critical' {
     const mem = process.memoryUsage()
-    const usagePercent = (mem.heapUsed / mem.heapTotal) * 100
-
-    if (usagePercent > config.watchdog.ram.criticalThreshold) return 'critical'
-    if (usagePercent > config.watchdog.ram.warningThreshold) return 'warning'
-    return 'ok'
+    return classifyHeapUsage(
+      mem.heapUsed,
+      getHeapStatistics().heap_size_limit,
+      config.watchdog.ram.warningThreshold,
+      config.watchdog.ram.criticalThreshold,
+    )
   }
 
   private checkStreams(): 'ok' | 'congested' | 'blocked' {
