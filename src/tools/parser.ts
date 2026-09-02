@@ -159,6 +159,14 @@ function getToolCloseTag(openTag: string): string {
   return namedMatch ? `</tool_call_${namedMatch[1]}>` : TOOL_END;
 }
 
+function extractNamedToolWrapperName(tag: string): string {
+  const normalizedTag = tag.trim();
+  const match = normalizedTag.match(
+    /^<\/?tool_call_([a-z0-9_-]+)>?$/i,
+  );
+  return match?.[1] ?? "";
+}
+
 function findToolCloseTag(
   buffer: string,
   openTag: string,
@@ -183,6 +191,7 @@ function findPartialToolOpenIndexOutsideMarkdownCode(
 ): number {
   let delimiterLength = initialDelimiterLength;
   const lowerToolStart = TOOL_START_LITERAL.toLowerCase();
+  const lowerToolCallPrefix = "<tool_call";
   const lowerToolCallingStart = TOOL_CALLING_START.toLowerCase();
   const lowerToolCallerStart = TOOL_CALLER_START.toLowerCase();
 
@@ -205,14 +214,6 @@ function findPartialToolOpenIndexOutsideMarkdownCode(
 
     if (delimiterLength === 0 && buffer[i] === "<") {
       const tailLower = buffer.substring(i).toLowerCase();
-      if (
-        tailLower.startsWith(lowerToolStart) &&
-        tailLower.indexOf(">") === -1 &&
-        (tailLower.length === lowerToolStart.length ||
-          /^[\s_~!:\-]/.test(tailLower[lowerToolStart.length]))
-      ) {
-        return i;
-      }
       if (lowerToolStart.startsWith(tailLower)) {
         return i;
       }
@@ -221,6 +222,15 @@ function findPartialToolOpenIndexOutsideMarkdownCode(
       }
       if (lowerToolCallerStart.startsWith(tailLower)) {
         return i;
+      }
+      if (tailLower.startsWith(lowerToolCallPrefix)) {
+        const suffix = tailLower.substring(lowerToolCallPrefix.length);
+        if (
+          suffix.length === 0 ||
+          (/^[\s_~!:\-]/.test(suffix) && !suffix.includes(">"))
+        ) {
+          return i;
+        }
       }
     }
 
@@ -333,10 +343,22 @@ function findPartialMissingOpenToolCallIndex(
 function findRecoverableMissingOpenToolCall(
   buffer: string,
   initialDelimiterLength = 0,
-): { textBefore: string; candidate: string; consumeLength: number } | null {
-  const lower = buffer.toLowerCase();
-  const endIdx = lower.indexOf(TOOL_END);
-  if (endIdx === -1) return null;
+): {
+  textBefore: string;
+  candidate: string;
+  consumeLength: number;
+  openTag: string;
+} | null {
+  const closeMatch = buffer.match(
+    /<\/tool_call(?:[ \t]+[^>\r\n]*|[-_~!:][^>\r\n]*)?(?:>|\r?\n)/i,
+  );
+  if (closeMatch?.index === undefined) return null;
+
+  const endIdx = closeMatch.index;
+  const namedWrapperName = extractNamedToolWrapperName(closeMatch[0]);
+  const recoveredOpenTag = namedWrapperName
+    ? `<tool_call_${namedWrapperName}>`
+    : TOOL_START_LITERAL;
 
   const beforeEnd = buffer.substring(0, endIdx);
   const candidateStarts = findCandidateStarts(beforeEnd);
@@ -354,12 +376,18 @@ function findRecoverableMissingOpenToolCall(
     }
 
     const candidate = beforeEnd.substring(candidateStart).trim();
-    if (!looksLikeToolCallPayload(candidate)) continue;
+    if (
+      !looksLikeToolCallPayload(candidate) &&
+      !(namedWrapperName && candidate.startsWith("{"))
+    ) {
+      continue;
+    }
 
     return {
       textBefore: beforeEnd.substring(0, candidateStart),
       candidate,
-      consumeLength: endIdx + TOOL_END.length,
+      consumeLength: endIdx + closeMatch[0].length,
+      openTag: recoveredOpenTag,
     };
   }
 
@@ -853,6 +881,79 @@ export class StreamingToolParser {
     return null;
   }
 
+  private resolveToolNameFromNamedWrapper(
+    openTag: string,
+    args: Record<string, unknown>,
+  ): string | null {
+    if (this.declaredToolNameSet.size === 0) return null;
+
+    const candidates = new Set<string>();
+    const attributeName = extractToolName(openTag, "");
+    if (attributeName) {
+      const resolvedAttributeName = this.resolveDeclaredToolName(attributeName);
+      if (resolvedAttributeName) candidates.add(resolvedAttributeName);
+    }
+
+    const wrapperName = extractNamedToolWrapperName(openTag);
+    if (wrapperName) {
+      for (const emittedName of [wrapperName, `tool_${wrapperName}`]) {
+        const resolvedName = this.resolveDeclaredToolName(emittedName);
+        if (resolvedName) candidates.add(resolvedName);
+      }
+    }
+    if (candidates.size === 0) return null;
+
+    const argumentKeys = Object.keys(args);
+    const compatibleCandidates = [...candidates].filter((name) => {
+      const properties = this.getToolProperties(this.toolByName.get(name));
+      const propertyKeys = Object.keys(properties);
+      return (
+        propertyKeys.length === 0 ||
+        argumentKeys.every((key) =>
+          Object.prototype.hasOwnProperty.call(properties, key),
+        )
+      );
+    });
+    if (compatibleCandidates.length === 1) return compatibleCandidates[0];
+    if (!wrapperName) return null;
+
+    const inferredName = inferToolNameFromParameters(args, this.tools);
+    if (!inferredName) return null;
+
+    const normalizedWrapperName = normalizeToolNameForMatch(wrapperName);
+    const normalizedInferredName = normalizeToolNameForMatch(inferredName);
+    if (
+      normalizedInferredName !== normalizedWrapperName &&
+      normalizedInferredName !== `tool${normalizedWrapperName}`
+    ) {
+      return null;
+    }
+
+    return this.resolveDeclaredToolName(inferredName);
+  }
+
+  private tryParseNamedWrapperArguments(
+    content: string,
+  ): ParsedToolCall | null {
+    const parsed = parseJsonishString(content);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return null;
+    }
+
+    const args = parsed as Record<string, unknown>;
+    const toolName = this.resolveToolNameFromNamedWrapper(
+      this.currentOpenTag,
+      args,
+    );
+    if (!toolName) return null;
+
+    return {
+      id: `call_${crypto.randomUUID()}`,
+      name: toolName,
+      arguments: this.normalizeArgumentsForTool(toolName, args),
+    };
+  }
+
   private normalizeArgumentsForTool(
     name: string,
     args: Record<string, unknown>,
@@ -1166,7 +1267,7 @@ export class StreamingToolParser {
               );
             }
             this.holdLeadIn(missingOpenRecovery.textBefore);
-            this.currentOpenTag = TOOL_START_LITERAL;
+            this.currentOpenTag = missingOpenRecovery.openTag;
             this.buffer = this.buffer.substring(
               missingOpenRecovery.consumeLength,
             );
@@ -1451,6 +1552,12 @@ export class StreamingToolParser {
       return;
     }
 
+    const namedWrapperParsed = this.tryParseNamedWrapperArguments(t);
+    if (namedWrapperParsed) {
+      this.finalizeSuccessfulToolCall(namedWrapperParsed, result);
+      return;
+    }
+
     // 2) Try JSON array format
     if (t.startsWith("[")) {
       if (isToolcallDebugEnabled()) {
@@ -1589,6 +1696,7 @@ export class StreamingToolParser {
     // Never leak internal XML to user-visible content.
     // Restore lead-in text if no tools were emitted.
     logger.warn("[parser] Dropping malformed tool call block", {
+      openTag: this.currentOpenTag,
       contentPreview: t.substring(0, 500),
       hasName:
         t.includes('"name"') || t.includes('"tool"') || t.includes("tool_name"),
@@ -1616,6 +1724,9 @@ export class StreamingToolParser {
         blockPreview: block.substring(0, 300),
       });
     }
+
+    const namedWrapperParsed = this.tryParseNamedWrapperArguments(block);
+    if (namedWrapperParsed) return namedWrapperParsed;
 
     // Try full parse first
     const xmlParsed = parseXmlParameterToolCall(

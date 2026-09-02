@@ -57,6 +57,27 @@ const FLAT_TOOLS = [
   },
 ];
 
+const TOOL_SEARCH_TOOLS = [
+  {
+    type: "function",
+    function: {
+      name: "tool_search",
+      description: "Search deferred tools",
+      parameters: {
+        type: "object",
+        properties: {
+          queries: {
+            type: "array",
+            items: { type: "string" },
+          },
+          limit: { type: "integer" },
+        },
+        required: ["queries"],
+      },
+    },
+  },
+];
+
 function setupFetchMock(
   handler: (url: string, init?: RequestInit) => Response | Promise<Response>,
 ) {
@@ -478,6 +499,50 @@ test("stream: fragmented tool_call becomes structured tool_calls", async () => {
     assert.strictEqual(result.toolCalls[0].name, "read_file");
     assert.deepStrictEqual(JSON.parse(result.toolCalls[0].arguments), {
       path: "a.txt",
+    });
+    assert.strictEqual(result.finishReason, "tool_calls");
+  } finally {
+    restore();
+  }
+});
+
+test("stream: fragmented named wrapper with direct arguments becomes tool_search", async () => {
+  const complete =
+    '<tool_call_search>{"queries":["handoff file"]}</tool_call_search>';
+  const restore = setupFetchMock(() =>
+    createSseResponse([
+      `data: ${JSON.stringify({
+        choices: [
+          { delta: { phase: "answer", content: "<tool_call_" } },
+        ],
+      })}`,
+      `data: ${JSON.stringify({
+        choices: [{ delta: { phase: "answer", content: complete } }],
+      })}`,
+    ]),
+  );
+
+  try {
+    const req = new Request("http://localhost/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "qwen3.6-plus",
+        stream: true,
+        tools: TOOL_SEARCH_TOOLS,
+        messages: [{ role: "user", content: "find the handoff tool" }],
+      }),
+    });
+
+    const res = await app.fetch(req);
+    assert.strictEqual(res.status, 200);
+
+    const result = await collectStreamResult(res);
+    assert.strictEqual(result.content, "");
+    assert.strictEqual(result.toolCalls.length, 1);
+    assert.strictEqual(result.toolCalls[0].name, "tool_search");
+    assert.deepStrictEqual(JSON.parse(result.toolCalls[0].arguments), {
+      queries: ["handoff file"],
     });
     assert.strictEqual(result.finishReason, "tool_calls");
   } finally {

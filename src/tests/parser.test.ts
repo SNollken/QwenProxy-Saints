@@ -62,6 +62,42 @@ const EDIT_FILE_TOOLS = [
   },
 ];
 
+const TOOL_SEARCH_TOOLS = [
+  {
+    type: "function" as const,
+    function: {
+      name: "tool_search",
+      description: "Search deferred tools",
+      parameters: {
+        type: "object",
+        properties: {
+          queries: {
+            type: "array",
+            items: { type: "string" },
+          },
+          limit: { type: "integer" },
+        },
+        required: ["queries"],
+      },
+    },
+  },
+  {
+    type: "function" as const,
+    function: {
+      name: "search_files",
+      description: "Search local files",
+      parameters: {
+        type: "object",
+        properties: {
+          pattern: { type: "string" },
+          path: { type: "string" },
+        },
+        required: ["pattern"],
+      },
+    },
+  },
+];
+
 test("StreamingToolParser: basic tool call", () => {
   const parser = new StreamingToolParser();
 
@@ -84,6 +120,51 @@ test("StreamingToolParser: parses tool-specific wrapper tags", () => {
   assert.strictEqual(result.toolCalls[0].name, "terminal");
   assert.deepStrictEqual(result.toolCalls[0].arguments, {
     command: "printf ok",
+  });
+});
+
+test("StreamingToolParser: gets bridge name from a named wrapper with direct arguments", () => {
+  const parser = new StreamingToolParser(TOOL_SEARCH_TOOLS);
+  const result = parser.feed(
+    '<tool_call_search>{"queries":["handoff file"]}</tool_call_search>',
+  );
+
+  assert.strictEqual(result.text, "");
+  assert.strictEqual(result.toolCalls.length, 1);
+  assert.strictEqual(result.toolCalls[0].name, "tool_search");
+  assert.deepStrictEqual(result.toolCalls[0].arguments, {
+    queries: ["handoff file"],
+  });
+});
+
+test("StreamingToolParser: holds a fragmented named wrapper until it is complete", () => {
+  const parser = new StreamingToolParser(TOOL_SEARCH_TOOLS);
+  const first = parser.feed("<tool_call_");
+  const second = parser.feed(
+    'search>{"queries":["handoff"]}</tool_call_search>',
+  );
+
+  assert.strictEqual(first.text, "");
+  assert.strictEqual(first.toolCalls.length, 0);
+  assert.strictEqual(second.text, "");
+  assert.strictEqual(second.toolCalls.length, 1);
+  assert.strictEqual(second.toolCalls[0].name, "tool_search");
+  assert.deepStrictEqual(second.toolCalls[0].arguments, {
+    queries: ["handoff"],
+  });
+});
+
+test("StreamingToolParser: recovers direct arguments from a named closing wrapper", () => {
+  const parser = new StreamingToolParser(TOOL_SEARCH_TOOLS);
+  const result = parser.feed(
+    '>\n{"queries":["handoff document"]}\n</tool_call_search>',
+  );
+
+  assert.strictEqual(result.text, "");
+  assert.strictEqual(result.toolCalls.length, 1);
+  assert.strictEqual(result.toolCalls[0].name, "tool_search");
+  assert.deepStrictEqual(result.toolCalls[0].arguments, {
+    queries: ["handoff document"],
   });
 });
 
