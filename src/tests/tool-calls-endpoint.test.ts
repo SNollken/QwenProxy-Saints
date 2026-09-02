@@ -917,7 +917,7 @@ test("stream: unclosed tool_call is recovered on flush", async () => {
   }
 });
 
-test("non-stream: bare tool_call marker requests continuation without leaking text", async () => {
+test("non-stream: bare tool_call marker stops with a retry message", async () => {
   const restore = setupFetchMock(() =>
     createSseResponse([
       `data: ${JSON.stringify({
@@ -942,15 +942,18 @@ test("non-stream: bare tool_call marker requests continuation without leaking te
     assert.strictEqual(res.status, 200);
 
     const body = await res.json();
-    assert.strictEqual(body.choices[0].message.content, "");
+    assert.strictEqual(
+      body.choices[0].message.content,
+      "QwenBridge could not recover an incomplete tool call. Please retry the request.",
+    );
     assert.strictEqual(body.choices[0].message.tool_calls, undefined);
-    assert.strictEqual(body.choices[0].finish_reason, "length");
+    assert.strictEqual(body.choices[0].finish_reason, "stop");
   } finally {
     restore();
   }
 });
 
-test("stream: bare tool_call marker requests continuation without leaking text", async () => {
+test("stream: bare tool_call marker stops with a retry message", async () => {
   const restore = setupFetchMock(() =>
     createSseResponse([
       `data: ${JSON.stringify({
@@ -975,9 +978,48 @@ test("stream: bare tool_call marker requests continuation without leaking text",
     assert.strictEqual(res.status, 200);
 
     const result = await collectStreamResult(res);
-    assert.strictEqual(result.content, "");
+    assert.strictEqual(
+      result.content,
+      "QwenBridge could not recover an incomplete tool call. Please retry the request.",
+    );
     assert.strictEqual(result.toolCalls.length, 0);
-    assert.strictEqual(result.finishReason, "length");
+    assert.strictEqual(result.finishReason, "stop");
+  } finally {
+    restore();
+  }
+});
+
+test("stream: repeated corrupt nested tool markers never leak to clients", async () => {
+  const corrupt =
+    'Beleza, testando as tools:\n\n<tool_call<tool_call{}>> "terminal", "parameters": {}}\n' +
+    '</tool_call<tool_call{}>> "terminal", "parameters": {}}\n'.repeat(4);
+  const restore = setupFetchMock(() =>
+    createSseResponse([
+      `data: ${JSON.stringify({
+        choices: [{ delta: { phase: "answer", content: corrupt } }],
+      })}`,
+    ]),
+  );
+
+  try {
+    const req = new Request("http://localhost/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "qwen3.6-plus",
+        stream: true,
+        tools: TOOLS,
+        messages: [{ role: "user", content: "test tool calls" }],
+      }),
+    });
+
+    const res = await app.fetch(req);
+    assert.strictEqual(res.status, 200);
+
+    const result = await collectStreamResult(res);
+    assert.strictEqual(result.content, "Beleza, testando as tools:\n\n");
+    assert.strictEqual(result.toolCalls.length, 0);
+    assert.strictEqual(result.finishReason, "stop");
   } finally {
     restore();
   }

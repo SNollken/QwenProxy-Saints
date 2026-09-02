@@ -52,6 +52,9 @@ import {
   buildUsage,
 } from "./helpers.ts";
 
+const INCOMPLETE_TOOL_CALL_MESSAGE =
+  "QwenBridge could not recover an incomplete tool call. Please retry the request.";
+
 function firstString(...values: unknown[]): string | null {
   for (const value of values) {
     if (typeof value === "string" && value.trim()) return value;
@@ -522,11 +525,17 @@ export async function processNonStreamingResponse(
 
     const remainingParsed = toolParser
       ? toolParser.flush()
-      : { text: "", toolCalls: [], truncatedToolCall: false };
+      : {
+          text: "",
+          toolCalls: [],
+          truncatedToolCall: false,
+          bareToolCallMarker: false,
+        };
     const {
       text: remainingText,
       toolCalls: remainingToolCalls,
       truncatedToolCall,
+      bareToolCallMarker = false,
     } = remainingParsed;
 
     if (toolParser && isToolcallDebugEnabled()) {
@@ -551,6 +560,14 @@ export async function processNonStreamingResponse(
       });
     }
 
+    if (
+      bareToolCallMarker &&
+      toolCallsOut.length === 0 &&
+      finalContent.trim().length === 0
+    ) {
+      finalContent = INCOMPLETE_TOOL_CALL_MESSAGE;
+    }
+
     if (isToolcallDebugEnabled()) {
       logger.debug("[chat] non-stream: final toolcall summary", {
         totalToolCalls: toolCallsOut.length,
@@ -573,7 +590,7 @@ export async function processNonStreamingResponse(
       message.tool_calls = toolCallsOut;
     }
 
-    const finishReason = truncatedToolCall
+    const finishReason = truncatedToolCall && !bareToolCallMarker
       ? "length"
       : toolCallsOut.length
         ? "tool_calls"
@@ -1326,13 +1343,30 @@ export async function processStreamingResponse(
             toolCalls: [],
             toolCallDeltas: [],
             truncatedToolCall: false,
+            bareToolCallMarker: false,
           };
       const {
         text: remainingText,
         toolCalls: remainingToolCalls,
         toolCallDeltas: remainingToolCallDeltas,
         truncatedToolCall,
+        bareToolCallMarker = false,
       } = remainingParsed;
+
+      if (
+        bareToolCallMarker &&
+        toolParser?.getEmittedToolCallCount() === 0 &&
+        finalContent.trim().length === 0
+      ) {
+        finalContent = INCOMPLETE_TOOL_CALL_MESSAGE;
+        await writeEvent({
+          id: completionId,
+          object: "chat.completion.chunk",
+          created: createdTimestamp,
+          model: body.model,
+          choices: [makeChoice({ content: INCOMPLETE_TOOL_CALL_MESSAGE })],
+        });
+      }
 
       if (toolParser && isToolcallDebugEnabled()) {
         logger.debug("[chat] stream: parser flush result", {
@@ -1437,7 +1471,7 @@ export async function processStreamingResponse(
       // Finish reason + usage + [DONE]
       const usage = buildUsage(usageAccumulator);
 
-      const finalFinishReason = truncatedToolCall
+      const finalFinishReason = truncatedToolCall && !bareToolCallMarker
         ? "length"
         : toolParser && toolParser.getEmittedToolCallCount() > 0
           ? "tool_calls"

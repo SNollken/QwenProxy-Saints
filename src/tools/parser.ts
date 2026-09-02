@@ -19,6 +19,7 @@ export interface ParserResult {
   toolCalls: ParsedToolCall[];
   toolCallDeltas: ToolCallDelta[];
   truncatedToolCall: boolean;
+  bareToolCallMarker?: boolean;
 }
 
 export interface StreamingToolParserOptions {
@@ -149,6 +150,42 @@ function findNextToolOpenTagOutsideMarkdownCode(
   return null;
 }
 
+function findCorruptNestedToolMarkerOutsideMarkdownCode(
+  buffer: string,
+  initialDelimiterLength = 0,
+): { index: number; marker: string } | null {
+  let delimiterLength = initialDelimiterLength;
+
+  for (let i = 0; i < buffer.length;) {
+    if (buffer[i] === "`") {
+      let runLength = 1;
+      while (i + runLength < buffer.length && buffer[i + runLength] === "`") {
+        runLength++;
+      }
+
+      if (delimiterLength === 0) {
+        delimiterLength = runLength;
+      } else if (runLength >= delimiterLength) {
+        delimiterLength = 0;
+      }
+
+      i += runLength;
+      continue;
+    }
+
+    if (delimiterLength === 0 && buffer[i] === "<") {
+      const match = buffer
+        .substring(i)
+        .match(/^<\/?tool_call<tool_call\{\s*\}>>/i);
+      if (match) return { index: i, marker: match[0] };
+    }
+
+    i++;
+  }
+
+  return null;
+}
+
 function getToolCloseTag(openTag: string): string {
   const normalizedOpenTag = openTag.toLowerCase();
   if (normalizedOpenTag === TOOL_CALLING_START) {
@@ -194,6 +231,8 @@ function findPartialToolOpenIndexOutsideMarkdownCode(
   const lowerToolCallPrefix = "<tool_call";
   const lowerToolCallingStart = TOOL_CALLING_START.toLowerCase();
   const lowerToolCallerStart = TOOL_CALLER_START.toLowerCase();
+  const lowerCorruptOpenStart = "<tool_call<tool_call";
+  const lowerCorruptCloseStart = "</tool_call<tool_call";
 
   for (let i = 0; i < buffer.length;) {
     if (buffer[i] === "`") {
@@ -214,6 +253,15 @@ function findPartialToolOpenIndexOutsideMarkdownCode(
 
     if (delimiterLength === 0 && buffer[i] === "<") {
       const tailLower = buffer.substring(i).toLowerCase();
+      if (
+        lowerCorruptOpenStart.startsWith(tailLower) ||
+        lowerCorruptCloseStart.startsWith(tailLower) ||
+        ((tailLower.startsWith(lowerCorruptOpenStart) ||
+          tailLower.startsWith(lowerCorruptCloseStart)) &&
+          !tailLower.includes(">>"))
+      ) {
+        return i;
+      }
       if (lowerToolStart.startsWith(tailLower)) {
         return i;
       }
@@ -789,6 +837,7 @@ export class StreamingToolParser {
   private toolByName = new Map<string, ToolDefinitionLike>();
   private normalizedDeclaredToolNames = new Map<string, string>();
   private markdownCodeDelimiterLength = 0;
+  private suppressMalformedToolSyntax = false;
   private incrementalToolCalls = false;
   private activeIncrementalToolCall: ActiveIncrementalToolCall | null = null;
 
@@ -1220,13 +1269,37 @@ export class StreamingToolParser {
       truncatedToolCall: false,
     };
 
+    if (this.suppressMalformedToolSyntax) {
+      this.buffer = "";
+      return result;
+    }
+
     while (this.buffer.length > 0) {
       if (!this.insideTool) {
+        const corruptNestedMarker =
+          findCorruptNestedToolMarkerOutsideMarkdownCode(
+            this.buffer,
+            this.markdownCodeDelimiterLength,
+          );
         const match = findNextToolOpenTagOutsideMarkdownCode(
           this.buffer,
           this.markdownCodeDelimiterLength,
         );
-        if (match) {
+        if (
+          corruptNestedMarker &&
+          (!match || corruptNestedMarker.index <= match.index)
+        ) {
+          this.emitVisibleText(
+            result,
+            this.buffer.substring(0, corruptNestedMarker.index),
+          );
+          logger.warn("[parser] Suppressing corrupt nested tool call syntax", {
+            marker: corruptNestedMarker.marker,
+          });
+          this.buffer = "";
+          this.suppressMalformedToolSyntax = true;
+          break;
+        } else if (match) {
           // Text before the tool call tag
           const textBefore = this.buffer.substring(0, match.index);
           if (isToolcallDebugEnabled()) {
@@ -1423,6 +1496,7 @@ export class StreamingToolParser {
           "[parser] Dropping empty unclosed tool call at end of stream",
         );
         result.truncatedToolCall = true;
+        result.bareToolCallMarker = true;
         this.pendingLeadIn = "";
       }
     } else {
@@ -1442,6 +1516,9 @@ export class StreamingToolParser {
           },
         );
         result.truncatedToolCall = true;
+        result.bareToolCallMarker =
+          this.buffer.substring(partialOpenIndex).trim().toLowerCase() ===
+          "<tool_call";
       } else {
         this.emitVisibleText(result, this.buffer);
       }
@@ -1462,6 +1539,7 @@ export class StreamingToolParser {
     this.insideTool = false;
     this.currentOpenTag = TOOL_START_LITERAL;
     this.markdownCodeDelimiterLength = 0;
+    this.suppressMalformedToolSyntax = false;
     this.clearIncrementalToolCall();
     return result;
   }

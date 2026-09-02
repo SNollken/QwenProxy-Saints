@@ -168,6 +168,46 @@ test("StreamingToolParser: recovers direct arguments from a named closing wrappe
   });
 });
 
+test("StreamingToolParser: suppresses repeated corrupt nested tool markers", () => {
+  const parser = new StreamingToolParser(TOOLS);
+  const corrupt =
+    'Beleza, testando as tools:\n\n<tool_call<tool_call{}>> "terminal", "parameters": {}}\n' +
+    '</tool_call<tool_call{}>> "terminal", "parameters": {}}\n'.repeat(4);
+
+  const streamed = parser.feed(corrupt);
+  const flushed = parser.flush();
+
+  assert.strictEqual(streamed.text, "Beleza, testando as tools:\n\n");
+  assert.strictEqual(streamed.toolCalls.length, 0);
+  assert.strictEqual(flushed.text, "");
+  assert.strictEqual(flushed.toolCalls.length, 0);
+  assert.strictEqual(flushed.truncatedToolCall, false);
+});
+
+test("StreamingToolParser: holds a fragmented corrupt nested marker", () => {
+  const parser = new StreamingToolParser(TOOLS);
+
+  const first = parser.feed("Antes\n<tool_call<tool_");
+  const second = parser.feed(
+    'call{}>> "terminal", "parameters": {}}\n</tool_call<tool_call{}>>',
+  );
+
+  assert.strictEqual(first.text, "Antes\n");
+  assert.strictEqual(second.text, "");
+  assert.strictEqual(second.toolCalls.length, 0);
+  assert.strictEqual(parser.flush().truncatedToolCall, false);
+});
+
+test("StreamingToolParser: preserves corrupt-looking markers inside code", () => {
+  const parser = new StreamingToolParser(TOOLS);
+  const literal = "`<tool_call<tool_call{}>>`";
+
+  const result = parser.feed(literal);
+
+  assert.strictEqual(result.text, literal);
+  assert.strictEqual(result.toolCalls.length, 0);
+});
+
 test("StreamingToolParser: recovers punctuated wrapper tags", () => {
   const parser = new StreamingToolParser();
   const result = parser.feed(
