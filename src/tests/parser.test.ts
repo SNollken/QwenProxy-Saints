@@ -215,6 +215,8 @@ const TOOL_SEARCH_TOOLS = [
         properties: {
           pattern: { type: "string" },
           path: { type: "string" },
+          target: { type: "string" },
+          limit: { type: "integer" },
         },
         required: ["pattern"],
       },
@@ -259,6 +261,42 @@ test("StreamingToolParser: gets bridge name from a named wrapper with direct arg
   assert.deepStrictEqual(result.toolCalls[0].arguments, {
     queries: ["handoff file"],
   });
+});
+
+test("StreamingToolParser: maps nested search arguments to the uniquely compatible declared tool", () => {
+  for (const output of [
+    '<tool_call_search><arguments>{"pattern":"*handoff*","target":"files","limit":20}</arguments></tool_call_search>',
+    '<tool_call_search><arguments>{"pattern":"*handoff*","target":"files","limit":20}}</tool_call_search>',
+  ]) {
+    for (let split = 0; split <= output.length; split++) {
+      const parser = new StreamingToolParser(TOOL_SEARCH_TOOLS);
+      const first = parser.feed(output.slice(0, split));
+      const second = parser.feed(output.slice(split));
+      const tail = parser.flush();
+      const calls = [...first.toolCalls, ...second.toolCalls, ...tail.toolCalls];
+
+      assert.strictEqual(calls.length, 1, `split ${split}: ${output}`);
+      assert.strictEqual(calls[0].name, "search_files");
+      assert.deepStrictEqual(calls[0].arguments, {
+        pattern: "*handoff*",
+        target: "files",
+        limit: 20,
+      });
+      assert.strictEqual(first.text + second.text + tail.text, "");
+      assert.strictEqual(tail.truncatedToolCall, false);
+    }
+  }
+});
+
+test("StreamingToolParser: rejects nested search arguments that match no declared schema", () => {
+  const parser = new StreamingToolParser(TOOL_SEARCH_TOOLS);
+  const result = parser.feed(
+    '<tool_call_search><arguments>{"command":"rm -rf /"}</arguments></tool_call_search>',
+  );
+
+  assert.strictEqual(result.toolCalls.length, 0);
+  assert.strictEqual(result.text, "");
+  assert.strictEqual(result.malformedToolCall, true);
 });
 
 test("StreamingToolParser: holds a fragmented named wrapper until it is complete", () => {

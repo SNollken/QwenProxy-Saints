@@ -76,6 +76,23 @@ const TOOL_SEARCH_TOOLS = [
       },
     },
   },
+  {
+    type: "function",
+    function: {
+      name: "search_files",
+      description: "Search local files",
+      parameters: {
+        type: "object",
+        properties: {
+          pattern: { type: "string" },
+          target: { type: "string" },
+          path: { type: "string" },
+          limit: { type: "integer" },
+        },
+        required: ["pattern"],
+      },
+    },
+  },
 ];
 
 function setupFetchMock(
@@ -580,6 +597,56 @@ test("stream: fragmented named wrapper with direct arguments becomes tool_search
     restore();
   }
 });
+
+for (const stream of [false, true]) {
+  test(`${stream ? "stream" : "non-stream"}: nested search arguments become search_files`, async () => {
+    const output =
+      '<tool_call_search><arguments>{"pattern":"*handoff*","target":"files","limit":20}}</tool_call_search>';
+    const restore = setupFetchMock(() => createSseResponse([
+      `data: ${JSON.stringify({ choices: [{ delta: { phase: "answer", content: output } }] })}`,
+    ]));
+
+    try {
+      const response = await app.fetch(new Request("http://localhost/v1/chat/completions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: "qwen3.6-plus",
+          stream,
+          tools: TOOL_SEARCH_TOOLS,
+          messages: [{ role: "user", content: "find the handoff file" }],
+        }),
+      }));
+      assert.strictEqual(response.status, 200);
+
+      if (stream) {
+        const result = await collectStreamResult(response);
+        assert.strictEqual(result.finishReason, "tool_calls");
+        assert.strictEqual(result.content, "");
+        assert.strictEqual(result.toolCalls[0].name, "search_files");
+        assert.deepStrictEqual(JSON.parse(result.toolCalls[0].arguments), {
+          pattern: "*handoff*",
+          target: "files",
+          limit: 20,
+        });
+      } else {
+        const result = await response.json();
+        assert.strictEqual(result.choices[0].finish_reason, "tool_calls");
+        assert.strictEqual(result.choices[0].message.content, null);
+        assert.strictEqual(
+          result.choices[0].message.tool_calls[0].function.name,
+          "search_files",
+        );
+        assert.deepStrictEqual(
+          JSON.parse(result.choices[0].message.tool_calls[0].function.arguments),
+          { pattern: "*handoff*", target: "files", limit: 20 },
+        );
+      }
+    } finally {
+      restore();
+    }
+  });
+}
 
 test("stream: Qwen native control tokens become a structured tool call", async () => {
   const restore = setupFetchMock(() =>

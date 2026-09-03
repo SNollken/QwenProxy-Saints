@@ -88,6 +88,48 @@ function parseJsonishString(value: string): unknown {
   return undefined;
 }
 
+function parseNamedArgumentsContent(content: string): unknown {
+  let candidate = content.trim();
+  const closedWrapper = candidate.match(
+    /^<arguments>([\s\S]*?)<\/arguments>$/i,
+  );
+  if (closedWrapper) {
+    candidate = closedWrapper[1].trim();
+  } else if (/^<arguments>/i.test(candidate)) {
+    candidate = candidate.replace(/^<arguments>/i, "").trim();
+  } else {
+    return parseJsonishString(candidate);
+  }
+
+  const parsed = parseJsonishString(candidate);
+  if (parsed !== undefined) return parsed;
+  if (!candidate.startsWith("{")) return undefined;
+
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = 0; i < candidate.length; i++) {
+    const char = candidate[i];
+    if (escaped) {
+      escaped = false;
+    } else if (inString && char === "\\") {
+      escaped = true;
+    } else if (char === '"') {
+      inString = !inString;
+    } else if (!inString && char === "{") {
+      depth++;
+    } else if (!inString && char === "}") {
+      depth--;
+      if (depth === 0) {
+        if (candidate.slice(i + 1).trim() !== "}") return undefined;
+        return parseJsonishString(candidate.slice(0, i + 1));
+      }
+    }
+  }
+
+  return undefined;
+}
+
 function advanceMarkdownCodeState(
   text: string,
   initialDelimiterLength = 0,
@@ -1077,18 +1119,23 @@ export class StreamingToolParser {
         if (resolvedName) candidates.add(resolvedName);
       }
     }
-    if (candidates.size === 0) return null;
-
     const argumentKeys = Object.keys(args);
     const compatibleCandidates = [...candidates].filter((name) => {
-      const properties = this.getToolProperties(this.toolByName.get(name));
+      const tool = this.toolByName.get(name);
+      const properties = this.getToolProperties(tool);
       const propertyKeys = Object.keys(properties);
-      return (
+      const acceptsKeys = (
         propertyKeys.length === 0 ||
         argumentKeys.every((key) =>
           Object.prototype.hasOwnProperty.call(properties, key),
         )
       );
+      const schema = tool?.function?.parameters ??
+        (tool && "parameters" in tool ? tool.parameters : undefined);
+      const hasRequiredKeys = !schema?.required?.some((key) =>
+        !Object.prototype.hasOwnProperty.call(args, key)
+      );
+      return acceptsKeys && hasRequiredKeys;
     });
     if (compatibleCandidates.length === 1) return compatibleCandidates[0];
     if (!wrapperName) return null;
@@ -1098,20 +1145,32 @@ export class StreamingToolParser {
 
     const normalizedWrapperName = normalizeToolNameForMatch(wrapperName);
     const normalizedInferredName = normalizeToolNameForMatch(inferredName);
+    const inferredNameParts = inferredName.toLowerCase().split(/[^a-z0-9]+/);
     if (
       normalizedInferredName !== normalizedWrapperName &&
-      normalizedInferredName !== `tool${normalizedWrapperName}`
+      normalizedInferredName !== `tool${normalizedWrapperName}` &&
+      !inferredNameParts.includes(wrapperName.toLowerCase())
     ) {
       return null;
     }
 
-    return this.resolveDeclaredToolName(inferredName);
+    const resolvedInferredName = this.resolveDeclaredToolName(inferredName);
+    if (!resolvedInferredName) return null;
+    const inferredTool = this.toolByName.get(resolvedInferredName);
+    const inferredSchema = inferredTool?.function?.parameters ??
+      (inferredTool && "parameters" in inferredTool
+        ? inferredTool.parameters
+        : undefined);
+    if (inferredSchema?.required?.some((key) =>
+      !Object.prototype.hasOwnProperty.call(args, key)
+    )) return null;
+    return resolvedInferredName;
   }
 
   private tryParseNamedWrapperArguments(
     content: string,
   ): ParsedToolCall | null {
-    const parsed = parseJsonishString(content);
+    const parsed = parseNamedArgumentsContent(content);
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
       return null;
     }
