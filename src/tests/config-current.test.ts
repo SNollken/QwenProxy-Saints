@@ -1,6 +1,32 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+process.env.TEST_MOCK_QWEN_AUTH = "true";
 import { config } from "../core/config.ts";
+import { buildFinalContext } from "../routes/chat/context.ts";
+
+test("plain requests reset stale account tool instructions in personalization mode", async () => {
+  const original = config.qwen.personalizationFromRequest;
+  config.qwen.personalizationFromRequest = true;
+  try {
+    const context = await buildFinalContext({
+      messages: [{ role: "user", content: "210" }],
+      systemPrompt: "",
+      prompt: "User: 210",
+      currentPrompt: "User: 210",
+      modelId: "qwen3.8-max",
+      enableThinking: true,
+      conversationKey: null,
+      hasExplicitConversationKey: false,
+      isInternalSummarizationRequest: false,
+    });
+    const instruction = context.requestPersonalizationInstruction;
+    assert.ok(instruction);
+    assert.match(instruction, /no tools/i);
+    assert.strictEqual(context.finalPrompt, "User: 210");
+  } finally {
+    config.qwen.personalizationFromRequest = original;
+  }
+});
 
 test("config exposes only Playwright/thread-native current auth and context settings", () => {
   assert.equal(typeof config.playwright.headless, "boolean");

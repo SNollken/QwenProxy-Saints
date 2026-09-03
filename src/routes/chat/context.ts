@@ -93,8 +93,7 @@ export async function buildFinalContext(
     isInternalSummarizationRequest || isTitleGenerationRequest;
   const useRequestPersonalization =
     config.qwen.personalizationFromRequest &&
-    !isAuxiliaryRequest &&
-    systemPrompt.trim().length > 0;
+    !isAuxiliaryRequest;
   const estimatedTokens = estimateTokenCount(
     systemPrompt + activePrompt,
     modelId,
@@ -128,7 +127,9 @@ export async function buildFinalContext(
     isAuxiliaryRequest,
     isTitleGenerationRequest,
     requestPersonalizationInstruction: useRequestPersonalization
-      ? systemPrompt
+      ? systemPrompt.trim()
+        ? systemPrompt
+        : "No tools are available in this conversation. Respond directly to the user's request in plain text without tool calls."
       : null,
     hasExplicitConversationKey,
     allowThreadReuse,
