@@ -34,6 +34,48 @@ const FLAT_TOOLS = [
   },
 ];
 
+const TERMINAL_TOOLS = [{
+  type: "function" as const,
+  function: {
+    name: "terminal",
+    parameters: {
+      type: "object",
+      properties: { command: { type: "string" }, timeout: { type: "number" } },
+      required: ["command"],
+    },
+  },
+}];
+
+test("nested named parameters wait for the tool boundary across every split", () => {
+  const output = '<tool_call_terminal><tool_call_command>echo QWEN_LOAD_08_b6592c9</tool_call_command><tool_call_timeout>5</tool_call_timeout></tool_call_terminal>';
+  for (let split = 0; split <= output.length; split++) {
+    const parser = new StreamingToolParser(TERMINAL_TOOLS);
+    const first = parser.feed(output.slice(0, split));
+    if (split < output.length) assert.strictEqual(first.toolCalls.length, 0);
+    const last = parser.feed(output.slice(split));
+    const tail = parser.flush();
+    const calls = [...first.toolCalls, ...last.toolCalls, ...tail.toolCalls];
+    assert.strictEqual(calls.length, 1);
+    assert.strictEqual(calls[0].name, "terminal");
+    assert.deepStrictEqual(calls[0].arguments, { command: "echo QWEN_LOAD_08_b6592c9", timeout: 5 });
+    assert.strictEqual(first.text + last.text + tail.text, "");
+  }
+});
+
+test("nested named parameters reject unknown, missing and unclosed arguments", () => {
+  for (const content of [
+    "<tool_call_unknown>echo nope</tool_call_unknown>",
+    "<tool_call_timeout>5</tool_call_timeout>",
+    "<tool_call_command>echo incomplete",
+    "<tool_call_command>echo ok</tool_call_command><tool_call_timeout>incomplete",
+  ]) {
+    const parser = new StreamingToolParser(TERMINAL_TOOLS);
+    const first = parser.feed(`<tool_call_terminal>${content}</tool_call_terminal>`);
+    assert.strictEqual(first.toolCalls.length, 0);
+    assert.strictEqual(parser.flush().toolCalls.length, 0);
+  }
+});
+
 test("generic tool closer recovers named arguments without consuming a quoted closer", () => {
   const output = '<tool_call_read_file>{"path":"literal</tool>.txt"}</tool>';
   for (let split = 0; split <= output.length; split++) {

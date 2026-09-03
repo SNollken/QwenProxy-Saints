@@ -294,7 +294,8 @@ function findToolCloseTag(
 ): { index: number; length: number } | null {
   const expectedTag = getToolCloseTag(openTag);
   const expectedIndex = buffer.toLowerCase().indexOf(expectedTag.toLowerCase());
-  const malformedMatch = buffer.match(
+  const hasNamedChildren = /^\s*<tool_call_[a-z0-9_-]+>/i.test(buffer);
+  const malformedMatch = hasNamedChildren ? null : buffer.match(
     /<\/tool_call(?:[ \t]+[^>\r\n]*|[-_~!:|/][^>\r\n]*)?(?:>|\r?\n)/i,
   );
   let closeTag = expectedIndex !== -1
@@ -897,11 +898,11 @@ type FlatToolDefinition = {
   type?: string;
   name?: string;
   description?: string;
-  parameters?: { properties?: Record<string, unknown> };
+  parameters?: { properties?: Record<string, unknown>; required?: string[] };
   function?: {
     name?: string;
     description?: string;
-    parameters?: { properties?: Record<string, unknown> };
+    parameters?: { properties?: Record<string, unknown>; required?: string[] };
   };
 };
 
@@ -1103,6 +1104,40 @@ export class StreamingToolParser {
       name: toolName,
       arguments: this.normalizeArgumentsForTool(toolName, args),
     };
+  }
+
+  private tryParseNamedWrapperParameters(content: string): ParsedToolCall | null {
+    const name = this.resolveDeclaredToolName(
+      extractNamedToolWrapperName(this.currentOpenTag),
+    );
+    const tool = name ? this.toolByName.get(name) : undefined;
+    if (!name || !tool) return null;
+    const properties = this.getToolProperties(tool);
+    const args: Record<string, unknown> = {};
+    const parameters = /<tool_call_([a-z0-9_-]+)>([\s\S]*?)<\/tool_call_\1>/gi;
+    let end = 0;
+    for (const match of content.matchAll(parameters)) {
+      const key = match[1];
+      if (
+        content.slice(end, match.index).trim() ||
+        !Object.prototype.hasOwnProperty.call(properties, key) ||
+        Object.prototype.hasOwnProperty.call(args, key)
+      ) return null;
+      const property = properties[key];
+      const isString = property && typeof property === "object" &&
+        "type" in property && property.type === "string";
+      args[key] = isString
+        ? decodeXmlEntities(match[2].trim())
+        : coerceParameterValue(match[2]);
+      end = match.index + match[0].length;
+    }
+    if (!end || content.slice(end).trim()) return null;
+    const schema = tool.function?.parameters ??
+      ("parameters" in tool ? tool.parameters : undefined);
+    if (schema?.required?.some((key) => !Object.prototype.hasOwnProperty.call(args, key))) {
+      return null;
+    }
+    return { id: `call_${crypto.randomUUID()}`, name, arguments: args };
   }
 
   private isQwenNativeToolCall(content: string): boolean {
@@ -1850,7 +1885,8 @@ export class StreamingToolParser {
       return;
     }
 
-    const namedWrapperParsed = this.tryParseNamedWrapperArguments(t);
+    const namedWrapperParsed = this.tryParseNamedWrapperArguments(t) ||
+      this.tryParseNamedWrapperParameters(t);
     if (namedWrapperParsed) {
       this.finalizeSuccessfulToolCall(namedWrapperParsed, result);
       return;
@@ -2028,7 +2064,8 @@ export class StreamingToolParser {
       return this.tryParseQwenNativeToolCall(block);
     }
 
-    const namedWrapperParsed = this.tryParseNamedWrapperArguments(block);
+    const namedWrapperParsed = this.tryParseNamedWrapperArguments(block) ||
+      this.tryParseNamedWrapperParameters(block);
     if (namedWrapperParsed) return namedWrapperParsed;
 
     // Try full parse first
