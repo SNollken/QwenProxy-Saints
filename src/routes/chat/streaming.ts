@@ -580,7 +580,10 @@ export async function processNonStreamingResponse(
       finalContent.trim().length === 0 &&
       upstreamFinishReason !== "length"
     ) {
-      finalContent = INCOMPLETE_TOOL_CALL_MESSAGE;
+      return sendOpenAIError(
+        c,
+        createError(502, INCOMPLETE_TOOL_CALL_MESSAGE),
+      );
     }
 
     if (isToolcallDebugEnabled()) {
@@ -1488,14 +1491,16 @@ export async function processStreamingResponse(
         finalContent.trim().length === 0 &&
         upstreamFinishReason !== "length"
       ) {
-        finalContent += INCOMPLETE_TOOL_CALL_MESSAGE;
-        await writeEvent({
-          id: completionId,
-          object: "chat.completion.chunk",
-          created: createdTimestamp,
-          model: body.model,
-          choices: [makeChoice({ content: INCOMPLETE_TOOL_CALL_MESSAGE })],
-        });
+        const errorPayload = createError(
+          502,
+          INCOMPLETE_TOOL_CALL_MESSAGE,
+        ).toOpenAI();
+        const bufferedPayload = flushBuffer?.join("") ?? "";
+        await streamWriter.write(
+          `${bufferedPayload}data: ${JSON.stringify(errorPayload)}\n\ndata: [DONE]\n\n`,
+        );
+        flushBuffer = null;
+        return;
       }
 
       // Finish reason + usage + [DONE]

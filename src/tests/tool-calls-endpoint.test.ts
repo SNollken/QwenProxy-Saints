@@ -1070,7 +1070,7 @@ test("stream: unclosed tool_call is recovered on flush", async () => {
   }
 });
 
-test("non-stream: bare tool_call marker stops with a retry message", async () => {
+test("non-stream: bare tool_call marker returns a retryable upstream error", async () => {
   const restore = setupFetchMock(() =>
     createSseResponse([
       `data: ${JSON.stringify({
@@ -1092,21 +1092,18 @@ test("non-stream: bare tool_call marker stops with a retry message", async () =>
     });
 
     const res = await app.fetch(req);
-    assert.strictEqual(res.status, 200);
+    assert.strictEqual(res.status, 502);
 
     const body = await res.json();
-    assert.strictEqual(
-      body.choices[0].message.content,
-      "QwenBridge could not recover an incomplete tool call. Please retry the request.",
-    );
-    assert.strictEqual(body.choices[0].message.tool_calls, undefined);
-    assert.strictEqual(body.choices[0].finish_reason, "stop");
+    assert.strictEqual(body.error.type, "upstream_error");
+    assert.strictEqual(body.error.code, "upstream_unavailable");
+    assert.match(body.error.message, /could not recover an incomplete tool call/i);
   } finally {
     restore();
   }
 });
 
-test("stream: bare tool_call marker stops with a retry message", async () => {
+test("stream: bare tool_call marker emits a retryable upstream error event", async () => {
   const restore = setupFetchMock(() =>
     createSseResponse([
       `data: ${JSON.stringify({
@@ -1130,13 +1127,11 @@ test("stream: bare tool_call marker stops with a retry message", async () => {
     const res = await app.fetch(req);
     assert.strictEqual(res.status, 200);
 
-    const result = await collectStreamResult(res);
-    assert.strictEqual(
-      result.content,
-      "QwenBridge could not recover an incomplete tool call. Please retry the request.",
-    );
-    assert.strictEqual(result.toolCalls.length, 0);
-    assert.strictEqual(result.finishReason, "stop");
+    const payload = await res.text();
+    assert.match(payload, /"type":"upstream_error"/);
+    assert.match(payload, /"code":"upstream_unavailable"/);
+    assert.match(payload, /could not recover an incomplete tool call/i);
+    assert.doesNotMatch(payload, /"finish_reason":"stop"/);
   } finally {
     restore();
   }
@@ -1167,14 +1162,18 @@ for (const stream of [false, true]) {
           messages: [{ role: "user", content: "read a file" }],
         }),
       }));
-      assert.strictEqual(res.status, 200);
-      const result = stream ? await collectStreamResult(res) : null;
-      const body = stream ? null : await res.json();
-      assert.strictEqual(result?.finishReason ?? body.choices[0].finish_reason, "stop");
-      assert.strictEqual(result?.toolCalls.length ?? (body.choices[0].message.tool_calls?.length ?? 0), 0);
-      const content = result?.content ?? body.choices[0].message.content;
-      assert.match(content, /could not recover an incomplete tool call/i);
-      assert.doesNotMatch(content, /<\/?tool/);
+      if (stream) {
+        assert.strictEqual(res.status, 200);
+        const payload = await res.text();
+        assert.match(payload, /"type":"upstream_error"/);
+        assert.match(payload, /could not recover an incomplete tool call/i);
+        assert.doesNotMatch(payload, /<\/?tool/);
+      } else {
+        const body = await res.json();
+        assert.strictEqual(res.status, 502);
+        assert.strictEqual(body.error.type, "upstream_error");
+        assert.match(body.error.message, /could not recover an incomplete tool call/i);
+      }
     } finally {
       restore();
     }
