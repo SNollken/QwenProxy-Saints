@@ -20,6 +20,7 @@ export interface ParserResult {
   toolCallDeltas: ToolCallDelta[];
   truncatedToolCall: boolean;
   bareToolCallMarker?: boolean;
+  malformedToolCall?: boolean;
 }
 
 export interface StreamingToolParserOptions {
@@ -293,16 +294,34 @@ function findToolCloseTag(
 ): { index: number; length: number } | null {
   const expectedTag = getToolCloseTag(openTag);
   const expectedIndex = buffer.toLowerCase().indexOf(expectedTag.toLowerCase());
-  if (expectedIndex !== -1) {
-    return { index: expectedIndex, length: expectedTag.length };
-  }
-
   const malformedMatch = buffer.match(
     /<\/tool_call(?:[ \t]+[^>\r\n]*|[-_~!:|/][^>\r\n]*)?(?:>|\r?\n)/i,
   );
-  return malformedMatch?.index === undefined
+  let closeTag = expectedIndex !== -1
+    ? { index: expectedIndex, length: expectedTag.length }
+    : malformedMatch?.index === undefined
     ? null
     : { index: malformedMatch.index, length: malformedMatch[0].length };
+
+  // Qwen sometimes closes a named wrapper with </tool>. Do not mistake a
+  // literal closing tag inside JSON argument strings for the wrapper boundary.
+  let inString = false;
+  let escaped = false;
+  const lowerBuffer = buffer.toLowerCase();
+  for (let i = 0; i < (closeTag?.index ?? buffer.length); i++) {
+    const char = buffer[i];
+    if (escaped) {
+      escaped = false;
+    } else if (inString && char === "\\") {
+      escaped = true;
+    } else if (char === '"') {
+      inString = !inString;
+    } else if (!inString && lowerBuffer.startsWith("</tool>", i)) {
+      closeTag = { index: i, length: "</tool>".length };
+      break;
+    }
+  }
+  return closeTag;
 }
 
 function findPartialToolOpenIndexOutsideMarkdownCode(
@@ -1755,6 +1774,7 @@ export class StreamingToolParser {
     if (!t) {
       // Empty tool call - malformed. Restore lead-in if possible.
       logger.warn("[parser] Dropping empty tool call block");
+      result.malformedToolCall = true;
       if (
         this.emittedToolCallCount === 0 &&
         this.pendingLeadIn.trim().length > 0
@@ -1986,6 +2006,7 @@ export class StreamingToolParser {
       first100Chars: t.substring(0, 100),
       contentLength: t.length,
     });
+    result.malformedToolCall = true;
     if (
       this.emittedToolCallCount === 0 &&
       this.pendingLeadIn.trim().length > 0

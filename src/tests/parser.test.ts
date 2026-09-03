@@ -34,6 +34,29 @@ const FLAT_TOOLS = [
   },
 ];
 
+test("generic tool closer recovers named arguments without consuming a quoted closer", () => {
+  const output = '<tool_call_read_file>{"path":"literal</tool>.txt"}</tool>';
+  for (let split = 0; split <= output.length; split++) {
+    const parser = new StreamingToolParser(TOOLS);
+    const calls = [
+      ...parser.feed(output.slice(0, split)).toolCalls,
+      ...parser.feed(output.slice(split)).toolCalls,
+    ];
+    assert.strictEqual(calls.length, 1);
+    assert.strictEqual(calls[0].name, "read_file");
+    assert.deepStrictEqual(calls[0].arguments, { path: "literal</tool>.txt" });
+    assert.strictEqual(parser.flush().truncatedToolCall, false);
+  }
+});
+
+test("empty generic wrappers do not swallow the following valid tool", () => {
+  const parser = new StreamingToolParser(TOOLS);
+  const result = parser.feed('<tool_call_read_file></tool><tool_call>{"name":"read_file","arguments":{"path":"a.txt"}}</tool_call>');
+  assert.strictEqual(result.toolCalls.length, 1);
+  assert.deepStrictEqual(result.toolCalls[0].arguments, { path: "a.txt" });
+  assert.strictEqual(parser.flush().truncatedToolCall, false);
+});
+
 const EDIT_FILE_TOOLS = [
   {
     type: "function" as const,

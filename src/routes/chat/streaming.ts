@@ -201,6 +201,8 @@ export async function processNonStreamingResponse(
     let lastRawContentLength = 0;
     let lastRawContentSuffix = "";
     let finalContent = "";
+    let upstreamFinishReason: string | null = null;
+    let malformedToolCall = false;
     let targetResponseId: string | null = null;
     let currentUiSessionId = uiSessionId;
     const toolParser = shouldParseToolCalls
@@ -241,7 +243,9 @@ export async function processNonStreamingResponse(
         return;
       }
 
-      const { text, toolCalls } = toolParser.feed(textChunk);
+      const parsed = toolParser.feed(textChunk);
+      const { text, toolCalls } = parsed;
+      malformedToolCall ||= parsed.malformedToolCall ?? false;
       if (text) {
         finalContent += text;
       }
@@ -417,6 +421,15 @@ export async function processNonStreamingResponse(
 
           applyUpstreamUsage(usageAccumulator, chunk.usage);
 
+          const finishReason = chunk.choices?.[0]?.finish_reason;
+          if (
+            typeof finishReason === "string" &&
+            (!chunk.response_id || targetResponseId === null ||
+              chunk.response_id === targetResponseId)
+          ) {
+            upstreamFinishReason = finishReason;
+          }
+
           let vStr = "";
           let foundStr = false;
           let isThinkingChunk = false;
@@ -530,13 +543,14 @@ export async function processNonStreamingResponse(
           toolCalls: [],
           truncatedToolCall: false,
           bareToolCallMarker: false,
+          malformedToolCall: false,
         };
     const {
       text: remainingText,
       toolCalls: remainingToolCalls,
       truncatedToolCall,
-      bareToolCallMarker = false,
     } = remainingParsed;
+    malformedToolCall ||= remainingParsed.malformedToolCall ?? false;
 
     if (toolParser && isToolcallDebugEnabled()) {
       logger.debug("[chat] non-stream: parser flush result", {
@@ -561,9 +575,10 @@ export async function processNonStreamingResponse(
     }
 
     if (
-      bareToolCallMarker &&
+      (truncatedToolCall || malformedToolCall) &&
       toolCallsOut.length === 0 &&
-      finalContent.trim().length === 0
+      finalContent.trim().length === 0 &&
+      upstreamFinishReason !== "length"
     ) {
       finalContent = INCOMPLETE_TOOL_CALL_MESSAGE;
     }
@@ -590,8 +605,10 @@ export async function processNonStreamingResponse(
       message.tool_calls = toolCallsOut;
     }
 
-    const finishReason = truncatedToolCall && !bareToolCallMarker
-      ? "length"
+    // Broken tool syntax is not evidence that the model hit its token limit.
+    const finishReason = upstreamFinishReason === "length" ||
+      upstreamFinishReason === "content_filter"
+      ? upstreamFinishReason
       : toolCallsOut.length
         ? "tool_calls"
         : "stop";
@@ -861,6 +878,8 @@ export async function processStreamingResponse(
       let lastRawContentLength = 0;
       let lastRawContentSuffix = "";
       let finalContent = "";
+      let upstreamFinishReason: string | null = null;
+      let malformedToolCall = false;
       let reasoningBuffer = "";
       let targetResponseId: string | null = null;
       const toolParser = shouldParseToolCalls
@@ -907,7 +926,9 @@ export async function processStreamingResponse(
           return;
         }
 
-        const { text, toolCalls, toolCallDeltas } = toolParser.feed(textChunk);
+        const parsed = toolParser.feed(textChunk);
+        const { text, toolCalls, toolCallDeltas } = parsed;
+        malformedToolCall ||= parsed.malformedToolCall ?? false;
 
         if (
           isToolcallDebugEnabled() &&
@@ -1106,9 +1127,7 @@ export async function processStreamingResponse(
 
           const dataStr = trimmed.slice(6);
           if (dataStr === "[DONE]") {
-            if (!clientDisconnected) {
-              await streamWriter.write("data: [DONE]\n\n");
-            }
+            // Client DONE belongs after parser flush, finish reason and usage.
             continue;
           }
 
@@ -1206,6 +1225,15 @@ export async function processStreamingResponse(
             }
 
             applyUpstreamUsage(usageAccumulator, chunk.usage);
+
+            const finishReason = chunk.choices?.[0]?.finish_reason;
+            if (
+              typeof finishReason === "string" &&
+              (!chunk.response_id || targetResponseId === null ||
+                chunk.response_id === targetResponseId)
+            ) {
+              upstreamFinishReason = finishReason;
+            }
 
             let vStr = "";
             let foundStr = false;
@@ -1344,29 +1372,15 @@ export async function processStreamingResponse(
             toolCallDeltas: [],
             truncatedToolCall: false,
             bareToolCallMarker: false,
+            malformedToolCall: false,
           };
       const {
         text: remainingText,
         toolCalls: remainingToolCalls,
         toolCallDeltas: remainingToolCallDeltas,
         truncatedToolCall,
-        bareToolCallMarker = false,
       } = remainingParsed;
-
-      if (
-        bareToolCallMarker &&
-        toolParser?.getEmittedToolCallCount() === 0 &&
-        finalContent.trim().length === 0
-      ) {
-        finalContent = INCOMPLETE_TOOL_CALL_MESSAGE;
-        await writeEvent({
-          id: completionId,
-          object: "chat.completion.chunk",
-          created: createdTimestamp,
-          model: body.model,
-          choices: [makeChoice({ content: INCOMPLETE_TOOL_CALL_MESSAGE })],
-        });
-      }
+      malformedToolCall ||= remainingParsed.malformedToolCall ?? false;
 
       if (toolParser && isToolcallDebugEnabled()) {
         logger.debug("[chat] stream: parser flush result", {
@@ -1468,11 +1482,28 @@ export async function processStreamingResponse(
         });
       }
 
+      if (
+        (truncatedToolCall || malformedToolCall) &&
+        toolParser?.getEmittedToolCallCount() === 0 &&
+        finalContent.trim().length === 0 &&
+        upstreamFinishReason !== "length"
+      ) {
+        finalContent += INCOMPLETE_TOOL_CALL_MESSAGE;
+        await writeEvent({
+          id: completionId,
+          object: "chat.completion.chunk",
+          created: createdTimestamp,
+          model: body.model,
+          choices: [makeChoice({ content: INCOMPLETE_TOOL_CALL_MESSAGE })],
+        });
+      }
+
       // Finish reason + usage + [DONE]
       const usage = buildUsage(usageAccumulator);
 
-      const finalFinishReason = truncatedToolCall && !bareToolCallMarker
-        ? "length"
+      const finalFinishReason = upstreamFinishReason === "length" ||
+        upstreamFinishReason === "content_filter"
+        ? upstreamFinishReason
         : toolParser && toolParser.getEmittedToolCallCount() > 0
           ? "tool_calls"
           : "stop";

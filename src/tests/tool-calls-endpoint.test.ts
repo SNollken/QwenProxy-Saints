@@ -1044,6 +1044,104 @@ test("stream: bare tool_call marker stops with a retry message", async () => {
   }
 });
 
+for (const stream of [false, true]) {
+  for (const malformed of [
+    "<tool_call_terminal>\n</tool>\n\n<tool_call_terminal>\n</tool>\n\n<tool_call_terminal>\n</tool>",
+    "<tool_call_terminal>\n>\n</tool>",
+    "<tool_call>{invalid",
+  ]) {
+  test(`${stream ? "stream" : "non-stream"}: malformed tool wrappers are not a token limit (${malformed.length} chars)`, async () => {
+    const restore = setupFetchMock(() =>
+      createSseResponse([
+        `data: ${JSON.stringify({
+          choices: [{ delta: { phase: "answer", content:
+            malformed,
+          } }],
+        })}`,
+      ]),
+    );
+    try {
+      const res = await app.fetch(new Request("http://localhost/v1/chat/completions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: "qwen3.6-plus", stream, tools: TOOLS,
+          messages: [{ role: "user", content: "read a file" }],
+        }),
+      }));
+      assert.strictEqual(res.status, 200);
+      const result = stream ? await collectStreamResult(res) : null;
+      const body = stream ? null : await res.json();
+      assert.strictEqual(result?.finishReason ?? body.choices[0].finish_reason, "stop");
+      assert.strictEqual(result?.toolCalls.length ?? (body.choices[0].message.tool_calls?.length ?? 0), 0);
+      const content = result?.content ?? body.choices[0].message.content;
+      assert.match(content, /could not recover an incomplete tool call/i);
+      assert.doesNotMatch(content, /<\/?tool/);
+    } finally {
+      restore();
+    }
+  });
+  }
+
+  test(`${stream ? "stream" : "non-stream"}: preserves an actual upstream token limit`, async () => {
+    const restore = setupFetchMock(() =>
+      createSseResponse([
+        `data: ${JSON.stringify({ choices: [{ delta: { phase: "answer", content: "Partial answer" } }] })}`,
+        `data: ${JSON.stringify({ choices: [{ finish_reason: "length" }] })}`,
+      ]),
+    );
+    try {
+      const res = await app.fetch(new Request("http://localhost/v1/chat/completions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: "qwen3.6-plus", stream, tools: TOOLS,
+          messages: [{ role: "user", content: "read a file" }],
+        }),
+      }));
+      assert.strictEqual(res.status, 200);
+      const result = stream ? await collectStreamResult(res) : null;
+      const body = stream ? null : await res.json();
+      assert.strictEqual(result?.finishReason ?? body.choices[0].finish_reason, "length");
+      assert.strictEqual(result?.content ?? body.choices[0].message.content, "Partial answer");
+    } finally {
+      restore();
+    }
+  });
+}
+
+test("stream: recovered tools, finish reason and usage precede the only DONE", async () => {
+  const restore = setupFetchMock(() =>
+    createSseResponse([
+      `data: ${JSON.stringify({ choices: [{ delta: { phase: "answer", content:
+        '<tool_call>{"name":"read_file","arguments":{"path":"a.txt"}}',
+      } }] })}`,
+    ]),
+  );
+  try {
+    const res = await app.fetch(new Request("http://localhost/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "qwen3.6-plus", stream: true, tools: TOOLS,
+        stream_options: { include_usage: true },
+        messages: [{ role: "user", content: "read a file" }],
+      }),
+    }));
+    assert.strictEqual(res.status, 200);
+    const events = (await res.text()).split("\n").filter((line) => line.startsWith("data: "));
+    const doneIndex = events.indexOf("data: [DONE]");
+    assert.strictEqual(doneIndex, events.length - 1, "DONE must not precede parser flush");
+    assert.strictEqual(events.filter((line) => line === "data: [DONE]").length, 1);
+    const payloads = events.slice(0, doneIndex).map((line) => JSON.parse(line.slice(6)));
+    assert.ok(payloads.some((event) => event.choices?.[0]?.delta?.tool_calls?.[0]?.function?.name === "read_file"));
+    assert.ok(payloads.some((event) => event.choices?.[0]?.finish_reason === "tool_calls"));
+    assert.ok(payloads.some((event) => event.usage && event.choices.length === 0));
+  } finally {
+    restore();
+  }
+});
+
 test("stream: repeated corrupt nested tool markers never leak to clients", async () => {
   const corrupt =
     'Beleza, testando as tools:\n\n<tool_call<tool_call{}>> "terminal", "parameters": {}}\n' +
