@@ -5,22 +5,24 @@ import {
   keepAlivePlaywrightAccount,
 } from "./playwright.ts";
 import { humanDelay, sleep } from "./human-behavior.ts";
+import { getAccountRequestCount } from "../core/account-concurrency.ts";
+import { getAccountCooldownInfo } from "../core/account-manager.ts";
 
 let running = false;
 let intervalId: ReturnType<typeof setInterval> | null = null;
-let cycleInProgress = false;
+let pendingCycle: Promise<void> | null = null;
+let prepareMissingAccounts: (() => Promise<void>) | undefined;
 
 export function isSessionKeeperRunning(): boolean {
   return running;
 }
 
-async function runKeepAliveCycle(): Promise<void> {
-  if (cycleInProgress) return;
-  cycleInProgress = true;
-  try {
+async function performKeepAliveCycle(): Promise<void> {
     if (config.sessionKeeper.enabled) {
+      await prepareMissingAccounts?.();
       const accountIds = getActivePlaywrightAccountIds();
       for (const accountId of accountIds) {
+        if (getAccountRequestCount(accountId) > 0 || getAccountCooldownInfo(accountId)) continue;
         await keepAlivePlaywrightAccount(accountId).catch((error) => {
           const message =
             error instanceof Error ? error.message : String(error);
@@ -45,19 +47,32 @@ async function runKeepAliveCycle(): Promise<void> {
         `🧹 [SessionKeeper] Closed ${closed} idle Playwright context(s)`,
       );
     }
-  } finally {
-    cycleInProgress = false;
-  }
 }
 
-export function startSessionKeeper(): void {
+function runKeepAliveCycle(): Promise<void> {
+  if (pendingCycle) return pendingCycle;
+  const cycle = performKeepAliveCycle();
+  pendingCycle = cycle;
+  const finished = () => {
+    if (pendingCycle === cycle) pendingCycle = null;
+  };
+  void cycle.then(finished, finished);
+  return cycle;
+}
+
+export function startSessionKeeper(options?: {
+  prepareMissingAccounts?: () => Promise<void>;
+}): void {
   const hasKeepAliveWork = config.sessionKeeper.enabled;
   const hasIdleCleanupWork = config.playwright.idleContextTtlMs > 0;
   if (running || (!hasKeepAliveWork && !hasIdleCleanupWork)) return;
 
   running = true;
+  prepareMissingAccounts = options?.prepareMissingAccounts;
   intervalId = setInterval(() => {
-    if (running) void runKeepAliveCycle();
+    if (running) void runKeepAliveCycle().catch((error) => {
+      console.warn("[SessionKeeper] Cycle failed:", error instanceof Error ? error.message : String(error));
+    });
   }, config.sessionKeeper.intervalMs);
   intervalId.unref?.();
 
@@ -68,13 +83,14 @@ export function startSessionKeeper(): void {
   }
 }
 
-export function stopSessionKeeper(): void {
+export async function stopSessionKeeper(): Promise<void> {
   running = false;
   if (intervalId) {
     clearInterval(intervalId);
     intervalId = null;
   }
-  cycleInProgress = false;
+  prepareMissingAccounts = undefined;
+  await pendingCycle;
 }
 
 export async function runSessionKeeperOnceForTesting(): Promise<void> {

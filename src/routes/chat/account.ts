@@ -20,6 +20,10 @@ import {
 } from "../../services/playwright.ts";
 import { Mutex } from "../../core/mutex.ts";
 import {
+  acquireAccountRequestSlot,
+  getAccountRequestCount,
+} from "../../core/account-concurrency.ts";
+import {
   getNextAccount,
   getNextAvailableAccount,
   markAccountRateLimited,
@@ -87,6 +91,7 @@ export interface SelectedAccount {
 }
 
 export interface StreamCreationResult {
+  releaseAccountSlot: () => void;
   stream: ReadableStream;
   uiSessionId: string;
   activeAccountId: string;
@@ -136,17 +141,23 @@ export function selectWarmAccount<T extends { id: string }>(
     accounts.findIndex((candidate) => candidate.id === startAccountId),
   );
 
+  let selected: T | undefined;
+  let lowestLoad = config.accountRequests.maxConcurrent;
   for (let offset = 0; offset < accounts.length; offset++) {
     const candidate = accounts[(startIndex + offset) % accounts.length];
+    const load = getAccountRequestCount(candidate.id);
     if (
       activeAccountIds.has(candidate.id) &&
-      !getAccountCooldownInfo(candidate.id)
+      !getAccountCooldownInfo(candidate.id) &&
+      load < lowestLoad
     ) {
-      return candidate;
+      selected = candidate;
+      lowestLoad = load;
+      if (load === 0) break;
     }
   }
 
-  return undefined;
+  return selected;
 }
 
 function resolveInitialAccount(preferredAccountId?: string): {
@@ -457,6 +468,7 @@ export async function acquireUpstreamStream(
         });
 
         return {
+          releaseAccountSlot: result.releaseAccountSlot,
           stream: result.stream,
           uiSessionId: result.uiSessionId,
           activeAccountId: result.accountId,
@@ -579,6 +591,7 @@ export async function acquireUpstreamStream(
               headers: retryResult.headers,
             });
             return {
+              releaseAccountSlot: retryResult.releaseAccountSlot,
               stream: retryResult.stream,
               uiSessionId: retryResult.uiSessionId,
               activeAccountId: retryResult.accountId,
@@ -645,6 +658,7 @@ export async function acquireUpstreamStream(
 }
 
 interface CreateStreamSuccess {
+  releaseAccountSlot: () => void;
   success: true;
   stream: ReadableStream;
   uiSessionId: string;
@@ -661,6 +675,35 @@ interface CreateStreamFailure {
 }
 
 async function tryCreateStreamWithRetry(
+  ...args: Parameters<typeof createStreamWithRetry>
+): Promise<CreateStreamSuccess | CreateStreamFailure> {
+  const [params, accountId] = args;
+  const release = await acquireAccountRequestSlot(accountId, params.signal);
+  const releaseAccountSlot = () => {
+    params.signal?.removeEventListener("abort", releaseAccountSlot);
+    release();
+  };
+  params.signal?.addEventListener("abort", releaseAccountSlot, { once: true });
+  try {
+    params.signal?.throwIfAborted();
+    const cooldown = getAccountCooldownInfo(accountId);
+    if (cooldown) {
+      throw Object.assign(new Error("Account is on cooldown; retry after it expires."), {
+        upstreamStatus: 429,
+        retryAfterMs: cooldown.remainingMs,
+      });
+    }
+    const result = await createStreamWithRetry(...args);
+    if (result.success) return { ...result, releaseAccountSlot };
+    releaseAccountSlot();
+    return result;
+  } catch (error) {
+    releaseAccountSlot();
+    throw error;
+  }
+}
+
+async function createStreamWithRetry(
   params: {
     finalPrompt: string;
     fullPrompt: string;
@@ -681,7 +724,7 @@ async function tryCreateStreamWithRetry(
   },
   accountId: string,
   accountEmail: string,
-): Promise<CreateStreamSuccess | CreateStreamFailure> {
+): Promise<Omit<CreateStreamSuccess, "releaseAccountSlot"> | CreateStreamFailure> {
   let retries = 3;
   let retryDelay = config.retry.baseDelayMs;
   let attempt = 0;

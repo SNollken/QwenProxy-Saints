@@ -17,6 +17,7 @@ import { AuthError, NotFoundError } from "../core/errors.js";
 import type { QwenAccount } from "../core/accounts.js";
 import { adminApp } from "./admin.js";
 import { dashboardHtml } from "../dashboard/page.js";
+import { getAccountConcurrencyStats } from "../core/account-concurrency.ts";
 
 // Module-level state (initialized in startServer)
 let cache: MemoryCache | undefined;
@@ -136,11 +137,21 @@ app.get("/", (c) => c.html(dashboardHtml));
 
 app.get("/health", async (c) => {
   const status = await watchdog?.getStatus();
+  const { getPlaywrightStatus } = await import("../services/playwright.ts");
+  const runtimes = Object.values(getPlaywrightStatus());
   return c.json({
     status: status?.overall || "unknown",
     timestamp: Date.now(),
     metrics: {
       cache: await cache?.getStats(),
+    },
+    accountConcurrency: getAccountConcurrencyStats(),
+    accountRuntime: {
+      initialized: runtimes.filter((runtime) => runtime.initialized).length,
+      withHeaders: runtimes.filter((runtime) => runtime.initialized && runtime.hasHeaders).length,
+      prepareAll: process.env.PREPARE_ALL_ON_STARTUP === "true",
+      keepAlive: config.sessionKeeper.enabled,
+      idleCloseMs: config.playwright.idleContextTtlMs,
     },
   });
 });
@@ -313,6 +324,8 @@ async function prepareRemainingAccountsInBackground(params: {
 }
 
 async function cleanupServerResources(): Promise<void> {
+  const { stopSessionKeeper } = await import("../services/session-keeper.ts");
+  await stopSessionKeeper();
   const pendingAccountPreparation = accountPreparationPromise;
   if (pendingAccountPreparation) {
     await pendingAccountPreparation;
@@ -326,13 +339,6 @@ async function cleanupServerResources(): Promise<void> {
     await cache?.close();
   } finally {
     cache = undefined;
-  }
-
-  try {
-    const { stopSessionKeeper } = await import("../services/session-keeper.ts");
-    stopSessionKeeper();
-  } catch {
-    // Session keeper may not have been initialized.
   }
 
   if (config.qwen.deleteAllChatsOnShutdown) {
@@ -448,7 +454,7 @@ export async function startServer(options?: {
     }
     const { disableNativeTools, warmQwenChatPool } =
       await import("../services/qwen.ts");
-    const { initPlaywrightForAccount } =
+    const { initPlaywrightForAccount, getActivePlaywrightAccountIds } =
       await import("../services/playwright.ts");
 
     const BATCH_SIZE = config.playwright.initBatchSize;
@@ -521,7 +527,23 @@ export async function startServer(options?: {
 
     const { startSessionKeeper } =
       await import("../services/session-keeper.ts");
-    startSessionKeeper();
+    startSessionKeeper({
+      prepareMissingAccounts: process.env.PREPARE_ALL_ON_STARTUP === "true"
+        ? async () => {
+            await accountPreparationPromise;
+            const activeIds = new Set(getActivePlaywrightAccountIds());
+            const { availableAccounts: currentAccounts } = classifyStartupAccounts(loadAccounts());
+            await prepareRemainingAccountsInBackground({
+              accounts: currentAccounts.filter((account) => !activeIds.has(account.id)),
+              batchSize: BATCH_SIZE,
+              getAccountCredentials,
+              initPlaywrightForAccount,
+              disableNativeTools,
+              warmQwenChatPool,
+            });
+          }
+        : undefined,
+    });
 
     server = serve({
       fetch: app.fetch,

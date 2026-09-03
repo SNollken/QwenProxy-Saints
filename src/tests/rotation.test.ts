@@ -8,6 +8,7 @@ import {
   markAccountRateLimited,
 } from "../core/account-manager.ts";
 import { selectWarmAccount } from "../routes/chat/account.ts";
+import { acquireAccountRequestSlot } from "../core/account-concurrency.ts";
 
 test("Account Rotation: warm selection follows the round-robin anchor", () => {
   const accounts = [
@@ -30,6 +31,22 @@ test("Account Rotation: warm selection follows the round-robin anchor", () => {
     selectWarmAccount(accounts, activeAccountIds, "cold-2")?.id,
     "warm-1",
   );
+});
+
+test("Account Rotation: warm selection skips a full account", async () => {
+  const first = await acquireAccountRequestSlot("warm-1");
+  const second = await acquireAccountRequestSlot("warm-1");
+  try {
+    const selected = selectWarmAccount(
+      [{ id: "warm-1" }, { id: "warm-2" }],
+      new Set(["warm-1", "warm-2"]),
+      "warm-1",
+    );
+    assert.equal(selected?.id, "warm-2");
+  } finally {
+    first();
+    second();
+  }
 });
 
 test("Account Rotation: Round-Robin rotation cycle", async () => {

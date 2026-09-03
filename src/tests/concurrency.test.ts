@@ -1,6 +1,11 @@
 import test from "node:test";
 import assert from "node:assert";
 import { Mutex } from "../core/mutex.ts";
+import {
+  acquireAccountRequestSlot,
+  getAccountRequestCount,
+  getAccountConcurrencyStats,
+} from "../core/account-concurrency.ts";
 
 process.env.TEST_MOCK_QWEN_AUTH = "true";
 
@@ -100,6 +105,7 @@ test("Aborting a request cancels upstream acquisition before a response exists",
       }),
     ]);
     assert.equal(response.status, 499);
+    assert.equal(getAccountRequestCount("mock-account"), 0);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -241,4 +247,104 @@ test("No-thinking model variant is accepted", async () => {
     globalThis.fetch = originalFetch;
     await Promise.resolve();
   }
+});
+
+test("Per-account limit holds two slots until the full upstream response ends", async () => {
+  const originalFetch = globalThis.fetch;
+  let inFlight = 0;
+  let maxInFlight = 0;
+  let completed = 0;
+  globalThis.fetch = async (input: string | URL | Request, init?: RequestInit) => {
+    const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+    if (url.includes("/api/models")) {
+      return new Response(JSON.stringify({ data: [{
+        id: "qwen3.6-plus", owned_by: "qwen",
+        info: { created_at: Date.now(), meta: {} },
+      }] }));
+    }
+    if (url.includes("/api/v2/chat/completions")) {
+      inFlight++;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      return new Response(new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode(
+            'data: {"choices":[{"delta":{"phase":"answer","content":"O"}}]}\n\n',
+          ));
+          setTimeout(() => {
+            inFlight--;
+            completed++;
+            controller.enqueue(new TextEncoder().encode(
+              'data: {"choices":[{"delta":{"phase":"answer","content":"K"}}]}\n\ndata: [DONE]\n\n',
+            ));
+            controller.close();
+          }, 100);
+        },
+      }), { headers: { "Content-Type": "text/event-stream" } });
+    }
+    return originalFetch(input, init);
+  };
+
+  try {
+    const responses = await Promise.all(Array.from({ length: 6 }, (_, i) => app.fetch(
+      new Request("http://localhost/v1/chat/completions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: "qwen3.6-plus",
+          messages: [{ role: "user", content: `Concurrent slot ${i}` }],
+          stream: false,
+        }),
+      }),
+    )));
+    for (const response of responses) {
+      assert.equal(response.status, 200, await response.text());
+    }
+    assert.equal(completed, 6);
+    assert.equal(maxInFlight, 2, "A slot must remain held after upstream headers arrive");
+    assert.equal(inFlight, 0);
+    assert.equal(getAccountRequestCount("mock-account"), 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("Account slots queue FIFO, isolate accounts, and release idempotently", async () => {
+  const first = await acquireAccountRequestSlot("slots-fifo");
+  const second = await acquireAccountRequestSlot("slots-fifo");
+  const waiting = acquireAccountRequestSlot("slots-fifo");
+  const other = await acquireAccountRequestSlot("slots-other");
+  assert.equal(getAccountRequestCount("slots-fifo"), 2);
+  assert.equal(getAccountRequestCount("slots-other"), 1);
+  assert.equal(getAccountConcurrencyStats().queuedRequests, 1);
+  first();
+  first();
+  const third = await waiting;
+  assert.equal(getAccountRequestCount("slots-fifo"), 2);
+  second();
+  third();
+  other();
+  assert.equal(getAccountConcurrencyStats().activeRequests, 0);
+  assert.equal(getAccountConcurrencyStats().queuedRequests, 0);
+});
+
+test("Account slots remove cancelled and timed-out waiters without leaking capacity", async () => {
+  const first = await acquireAccountRequestSlot("slots-cancel");
+  const second = await acquireAccountRequestSlot("slots-cancel");
+  const controller = new AbortController();
+  const cancelled = acquireAccountRequestSlot("slots-cancel", controller.signal);
+  controller.abort();
+  await assert.rejects(cancelled, { name: "AbortError" });
+  const keepProcessAlive = setTimeout(() => {}, 1_000);
+  try {
+    await assert.rejects(acquireAccountRequestSlot("slots-cancel", undefined, 10), {
+      name: "AccountCapacityError",
+      upstreamStatus: 503,
+    });
+  } finally {
+    clearTimeout(keepProcessAlive);
+    first();
+    second();
+  }
+  assert.equal(getAccountRequestCount("slots-cancel"), 0);
+  assert.equal(getAccountConcurrencyStats().queuedRequests, 0);
 });

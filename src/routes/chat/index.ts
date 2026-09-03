@@ -106,6 +106,7 @@ function formatTimingHeader(timings: Record<string, number>): string {
 
 export async function chatCompletions(c: Context) {
   let releaseChatLock: (() => void) | null = null;
+  let releaseAccountSlot: (() => void) | null = null;
   const requestSignal = c.req.raw.signal;
   const startedAt = Date.now();
   const timings: Record<string, number> = {};
@@ -327,6 +328,8 @@ export async function chatCompletions(c: Context) {
       }
       throw streamResult.error || new Error("All accounts failed");
     }
+    releaseAccountSlot = streamResult.releaseAccountSlot;
+    const completeInitialAccount = streamResult.releaseAccountSlot;
 
     console.log(
       `🚀 [Chat] Request routed | ${streamResult.activeAccountLabel} | ${body.model} | ${msgCount} msg(s) | ${finalPrompt.length} chars${declaredTools.length ? ` | ${declaredTools.length} tool(s)` : ""}${files.length ? ` | ${files.length} file(s)` : ""}`,
@@ -420,6 +423,7 @@ export async function chatCompletions(c: Context) {
       tokenEstimationContext: streamResult.tokenEstimationContext,
       onAssistantComplete,
       onStreamComplete: () => {
+        completeInitialAccount();
         if (releaseChatLock) {
           releaseChatLock();
           releaseChatLock = null;
@@ -438,6 +442,7 @@ export async function chatCompletions(c: Context) {
           ? await processStreamingResponse(currentParams)
           : await processNonStreamingResponse(currentParams);
       } catch (streamErr: any) {
+        currentStreamResult.releaseAccountSlot();
         requestSignal.throwIfAborted();
         // Only retry RetryableQwenStreamError (quota/anti-bot during stream)
         if (
@@ -519,6 +524,7 @@ export async function chatCompletions(c: Context) {
             // Can't get new stream, fail with original error
             throw streamErr;
           }
+          releaseAccountSlot = newStreamResult.releaseAccountSlot;
 
           console.log(
             `🔄 [Chat] Request routed | ${newStreamResult.activeAccountLabel} | ${body.model} | ${retryMessageCount} msg(s) | ${retryFinalPrompt.length} chars${declaredTools.length ? ` | ${declaredTools.length} tool(s)` : ""}${files.length ? ` | ${files.length} file(s)` : ""} | retry`,
@@ -550,6 +556,7 @@ export async function chatCompletions(c: Context) {
             tokenEstimationContext: newStreamResult.tokenEstimationContext,
             onAssistantComplete,
             onStreamComplete: () => {
+              newStreamResult.releaseAccountSlot();
               if (releaseChatLock) {
                 releaseChatLock();
                 releaseChatLock = null;
@@ -564,6 +571,7 @@ export async function chatCompletions(c: Context) {
       }
     }
   } catch (err) {
+    releaseAccountSlot?.();
     timings.preResponse = Date.now() - startedAt;
     c.header("X-QwenBridge-Timing", formatTimingHeader(timings));
     if (releaseChatLock) {

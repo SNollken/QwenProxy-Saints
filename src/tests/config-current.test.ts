@@ -20,6 +20,8 @@ test("config exposes only Playwright/thread-native current auth and context sett
   assert.equal(typeof config.playwright.initBatchSize, "number");
   assert.equal(typeof config.playwright.contextCloseTimeoutMs, "number");
   assert.equal(typeof config.playwright.idleContextTtlMs, "number");
+  assert.equal(typeof config.accountRequests.maxConcurrent, "number");
+  assert.equal(typeof config.accountRequests.queueTimeoutMs, "number");
   assert.equal(typeof config.sessionKeeper.enabled, "boolean");
   assert.equal(typeof config.sessionKeeper.intervalMs, "number");
   assert.equal(typeof config.sessionKeeper.idleMs, "number");

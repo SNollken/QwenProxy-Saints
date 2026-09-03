@@ -252,6 +252,9 @@ npm run test:live  # Só reais/live
 | `PLAYWRIGHT_INIT_BATCH_SIZE` | `1` | Quantas contas inicializar em paralelo no startup. Use baixo para evitar pico de RAM. |
 | `PLAYWRIGHT_CONTEXT_CLOSE_TIMEOUT_MS` | `10000` | Timeout para fechar contexto/browser antes do kill best-effort. |
 | `PLAYWRIGHT_IDLE_CONTEXT_TTL_MS` | `600000` | Fecha contextos Playwright ociosos após esse tempo (`0` desativa). |
+| `ACCOUNT_MAX_CONCURRENT_REQUESTS` | `2` | Máximo de requisições simultâneas por conta; as seguintes aguardam uma vaga. |
+| `ACCOUNT_REQUEST_QUEUE_TIMEOUT_MS` | `30000` | Tempo máximo aguardando uma vaga antes de retornar `503`. |
+| `PREPARE_ALL_ON_STARTUP` | `false` | Prepara todas as contas disponíveis no startup e repara contas ausentes no keep-alive. |
 | `SESSION_KEEP_ALIVE_ENABLED` | `false` | Mantém sessões ativas com atividade leve apenas quando a conta está ociosa. Opt-in para evitar Chromes permanentes. |
 | `SESSION_KEEP_ALIVE_INTERVAL_MS` | `180000` | Intervalo entre ciclos de keep-alive/limpeza. |
 | `SESSION_KEEP_ALIVE_IDLE_MS` | `120000` | Tempo mínimo sem uso antes de uma conta ser elegível ao keep-alive. |
