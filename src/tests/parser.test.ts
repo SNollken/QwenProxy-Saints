@@ -46,6 +46,65 @@ const TERMINAL_TOOLS = [{
   },
 }];
 
+test("named XML tool envelopes recover complete parameters across every split", () => {
+  const body = '<tool_name>terminal</tool_name><parameter name="command">echo "</tool>"</parameter_name><parameter name="timeout">5</parameter>';
+  for (const output of [
+    `<tool>${body}</invoke>`,
+    `<tool_calls>${body}</tool_calls>`,
+    `<tool_calls><tool>${body}</invoke></tool_calls>`,
+    `<tool_call_calls><tool>${body}</invoke></tool_calls>`,
+  ]) {
+    for (let split = 0; split <= output.length; split++) {
+      const parser = new StreamingToolParser(TERMINAL_TOOLS);
+      const first = parser.feed(output.slice(0, split));
+      if (split < output.length) assert.strictEqual(first.toolCalls.length, 0);
+      const last = parser.feed(output.slice(split));
+      const tail = parser.flush();
+      const calls = [...first.toolCalls, ...last.toolCalls, ...tail.toolCalls];
+      assert.strictEqual(calls.length, 1, `${output} split ${split}`);
+      assert.strictEqual(calls[0].name, "terminal");
+      assert.deepStrictEqual(calls[0].arguments, { command: 'echo "</tool>"', timeout: 5 });
+      assert.strictEqual(first.text + last.text + tail.text, "");
+    }
+  }
+});
+
+test("named XML groups preserve separate calls instead of merging parameters", () => {
+  const output = '<tool_calls><tool><tool_name>terminal</tool_name><parameter name="command">echo ONE</parameter_name></invoke><tool><tool_name>terminal</tool_name><parameter name="command">echo TWO</parameter_name></tool></tool_calls>';
+  const parser = new StreamingToolParser(TERMINAL_TOOLS);
+  const calls = [...output].flatMap((character) => parser.feed(character).toolCalls);
+  assert.deepStrictEqual(calls.map((call) => call.arguments), [{ command: "echo ONE" }, { command: "echo TWO" }]);
+  assert.strictEqual(parser.flush().text, "");
+});
+
+test("named XML rejects incomplete, duplicate, unknown and unlabeled parameters", () => {
+  for (const body of [
+    'echo TEST</parameter_name>',
+    '<parameter name="command">echo INCOMPLETE',
+    '<parameter name="timeout">5</parameter_name>',
+    '<parameter name="command">echo ONE</parameter_name><parameter name="command">echo TWO</parameter_name>',
+    '<parameter name="command">echo ONE</parameter_name><parameter name="unknown">5</parameter_name>',
+  ]) {
+    const parser = new StreamingToolParser(TERMINAL_TOOLS);
+    const first = parser.feed(`<tool_calls><tool_name>terminal</tool_name>${body}</tool_calls>`);
+    const tail = parser.flush();
+    assert.strictEqual(first.toolCalls.length + tail.toolCalls.length, 0);
+    assert.strictEqual(first.text + tail.text, "");
+    assert.ok(first.malformedToolCall || tail.truncatedToolCall);
+  }
+});
+
+test("named XML preserves literal code and never invokes undeclared tools", () => {
+  const literal = '<tool_calls><tool_name>unknown</tool_name><parameter name="command">echo TEST</parameter_name></tool_calls>';
+  for (const output of [literal, `\`${literal}\``, `\`\`\`xml\n${literal}\n\`\`\``]) {
+    const parser = new StreamingToolParser(TERMINAL_TOOLS);
+    const results = [...output].map((character) => parser.feed(character));
+    results.push(parser.flush());
+    assert.strictEqual(results.flatMap((result) => result.toolCalls).length, 0);
+    assert.strictEqual(results.map((result) => result.text).join(""), output);
+  }
+});
+
 test("nested named parameters wait for the tool boundary across every split", () => {
   const output = '<tool_call_terminal><tool_call_command>echo QWEN_LOAD_08_b6592c9</tool_call_command><tool_call_timeout>5</tool_call_timeout></tool_call_terminal>';
   for (let split = 0; split <= output.length; split++) {

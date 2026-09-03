@@ -144,7 +144,7 @@ function findNextToolOpenTagOutsideMarkdownCode(
       const match = buffer
         .substring(i)
         .match(
-          /^(?:<tool_calling>|<tool_caller>|<tool_call(?:[ \t]+[^>\r\n]*|[-_~!:|][^>\r\n]*)?(?:>|\r?\n))/i,
+          /^(?:<tool>|<tool_calls>|<tool_calling>|<tool_caller>|<tool_call(?:[ \t]+[^>\r\n]*|[-_~!:|][^>\r\n]*)?(?:>|\r?\n))/i,
         );
       if (match) {
         return { index: i, openTag: match[0] };
@@ -272,6 +272,8 @@ function findPartialQwenNativeSectionEndIndexOutsideMarkdownCode(
 
 function getToolCloseTag(openTag: string): string {
   const normalizedOpenTag = openTag.toLowerCase();
+  if (normalizedOpenTag === "<tool>") return "</tool>";
+  if (normalizedOpenTag === "<tool_calls>") return "</tool_calls>";
   if (normalizedOpenTag === TOOL_CALLING_START) {
     return TOOL_CALLING_END;
   }
@@ -292,6 +294,25 @@ function findToolCloseTag(
   buffer: string,
   openTag: string,
 ): { index: number; length: number } | null {
+  if (/^<(?:tool|tool_calls|tool_call_calls)>$/i.test(openTag)) {
+    const grouped = openTag.toLowerCase() !== "<tool>";
+    const tags = /<parameter\b[^>]*>|<\/(?:tool_calls|tool_call_calls|tool|invoke)>/gi;
+    let match: RegExpExecArray | null;
+    while ((match = tags.exec(buffer)) !== null) {
+      if (/^<parameter\b/i.test(match[0])) {
+        // A command may contain a literal </tool>; its parameter must close first.
+        const parameterEnd = /<\/parameter(?:_name)?>/gi;
+        parameterEnd.lastIndex = tags.lastIndex;
+        if (!parameterEnd.exec(buffer)) return null;
+        tags.lastIndex = parameterEnd.lastIndex;
+      } else if (grouped
+        ? /^<\/(?:tool_calls|tool_call_calls)>$/i.test(match[0])
+        : /^<\/(?:tool|invoke)>$/i.test(match[0])) {
+        return { index: match.index, length: match[0].length };
+      }
+    }
+    return null;
+  }
   const expectedTag = getToolCloseTag(openTag);
   const expectedIndex = buffer.toLowerCase().indexOf(expectedTag.toLowerCase());
   const hasNamedChildren = /^\s*<tool_call_[a-z0-9_-]+>/i.test(buffer);
@@ -372,6 +393,9 @@ function findPartialToolOpenIndexOutsideMarkdownCode(
         return i;
       }
       if (lowerToolCallerStart.startsWith(tailLower)) {
+        return i;
+      }
+      if ("<tool>".startsWith(tailLower) || "<tool_calls>".startsWith(tailLower)) {
         return i;
       }
       if (tailLower.startsWith(lowerToolCallPrefix)) {
@@ -1140,6 +1164,69 @@ export class StreamingToolParser {
     return { id: `call_${crypto.randomUUID()}`, name, arguments: args };
   }
 
+  private isNamedXmlToolCall(content: string): boolean {
+    return /^<(?:tool|tool_calls|tool_call_calls)>$/i.test(this.currentOpenTag) ||
+      /^\s*<tool_name>/i.test(content);
+  }
+
+  private parseNamedXmlToolCalls(content: string): {
+    calls: ParsedToolCall[];
+    undeclaredName?: string;
+  } | null {
+    let remaining = content.trim();
+    const blocks: string[] = [];
+    if (/^<tool>/i.test(remaining)) {
+      while (/^<tool>/i.test(remaining)) {
+        const body = remaining.slice("<tool>".length);
+        const boundary = findToolCloseTag(body, "<tool>");
+        if (!boundary) return null;
+        blocks.push(body.slice(0, boundary.index));
+        remaining = body.slice(boundary.index + boundary.length).trim();
+      }
+      if (remaining) return null;
+    } else {
+      blocks.push(remaining);
+    }
+
+    const calls: ParsedToolCall[] = [];
+    for (const block of blocks) {
+      const named = block.match(/^\s*<tool_name>([^<>]+)<\/tool_name>/i);
+      if (!named) return null;
+      const emittedName = decodeXmlEntities(named[1].trim());
+      const name = this.resolveDeclaredToolName(emittedName);
+      const tool = name ? this.toolByName.get(name) : undefined;
+      if (!name || !tool) return { calls: [], undeclaredName: emittedName };
+      const properties = this.getToolProperties(tool);
+      const args: Record<string, unknown> = {};
+      const body = block.slice(named[0].length);
+      const parameters = /<parameter\b[^>]*\bname\s*=\s*["']([^"']+)["'][^>]*>([\s\S]*?)<\/parameter(?:_name)?>/gi;
+      let end = 0;
+      for (const parameter of body.matchAll(parameters)) {
+        const key = parameter[1];
+        if (
+          body.slice(end, parameter.index).trim() ||
+          !Object.prototype.hasOwnProperty.call(properties, key) ||
+          Object.prototype.hasOwnProperty.call(args, key)
+        ) return null;
+        const property = properties[key];
+        const isString = property && typeof property === "object" &&
+          "type" in property && property.type === "string";
+        args[key] = isString
+          ? decodeXmlEntities(parameter[2].trim())
+          : coerceParameterValue(parameter[2]);
+        end = parameter.index + parameter[0].length;
+      }
+      if (body.slice(end).trim()) return null;
+      const schema = tool.function?.parameters ??
+        ("parameters" in tool ? tool.parameters : undefined);
+      if (schema?.required?.some((key) => !Object.prototype.hasOwnProperty.call(args, key))) {
+        return null;
+      }
+      calls.push({ id: `call_${crypto.randomUUID()}`, name, arguments: args });
+    }
+    return { calls };
+  }
+
   private isQwenNativeToolCall(content: string): boolean {
     return (
       /^<tool_call_(?:calls_section_begin|begin)\|>$/i.test(this.currentOpenTag) ||
@@ -1422,7 +1509,10 @@ export class StreamingToolParser {
     reason: string,
     closed = true,
   ): void {
-    const literalBlock = `${this.currentOpenTag}${content}${closed ? TOOL_END : ""}`;
+    const closingTag = /^<(?:tool|tool_calls)>$/i.test(this.currentOpenTag)
+      ? getToolCloseTag(this.currentOpenTag)
+      : TOOL_END;
+    const literalBlock = `${this.currentOpenTag}${content}${closed ? closingTag : ""}`;
     logger.warn("[parser] Preserving literal tool_call block as text", {
       reason,
       openTag: this.currentOpenTag,
@@ -1746,7 +1836,10 @@ export class StreamingToolParser {
             ),
           },
         );
-      } else if (partialOpenIndex !== -1) {
+      } else if (
+        partialOpenIndex !== -1 &&
+        this.buffer.substring(partialOpenIndex).toLowerCase() !== "<tool_calls"
+      ) {
         this.emitVisibleText(
           result,
           this.buffer.substring(0, partialOpenIndex),
@@ -1841,6 +1934,20 @@ export class StreamingToolParser {
         this.finalizeSuccessfulToolCall(nativeCall, result);
       } else {
         logger.warn("[parser] Dropping invalid or undeclared Qwen native tool call");
+        this.emitVisibleText(result, this.pendingLeadIn);
+        this.pendingLeadIn = "";
+      }
+      return;
+    }
+
+    if (this.isNamedXmlToolCall(t)) {
+      const parsed = this.parseNamedXmlToolCalls(t);
+      if (parsed?.undeclaredName) {
+        this.preserveLiteralToolCall(content, result, `undeclared tool name: ${parsed.undeclaredName}`);
+      } else if (parsed) {
+        for (const call of parsed.calls) this.finalizeSuccessfulToolCall(call, result);
+      } else {
+        result.malformedToolCall = true;
         this.emitVisibleText(result, this.pendingLeadIn);
         this.pendingLeadIn = "";
       }
@@ -2053,6 +2160,7 @@ export class StreamingToolParser {
   }
 
   private tryRecoverToolCall(block: string): ParsedToolCall | null {
+    if (this.isNamedXmlToolCall(block)) return null;
     if (isToolcallDebugEnabled()) {
       logger.debug("[parser] tryRecoverToolCall: starting recovery attempts", {
         blockLength: block.length,

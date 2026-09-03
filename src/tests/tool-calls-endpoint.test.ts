@@ -190,6 +190,37 @@ async function collectStreamResult(res: Response) {
   };
 }
 
+for (const stream of [false, true]) {
+  test(`${stream ? "stream" : "non-stream"}: named XML envelopes deliver complete arguments`, async () => {
+    const output = '<tool_calls><tool><tool_name>read_file</tool_name><parameter name="path">handoff.md</parameter_name></invoke></tool_calls>';
+    const restore = setupFetchMock(() => createSseResponse([...output].map((content) =>
+      `data: ${JSON.stringify({ choices: [{ delta: { phase: "answer", content } }] })}`,
+    )));
+    try {
+      const response = await app.fetch(new Request("http://localhost/v1/chat/completions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ model: "qwen3.6-plus", stream, tools: TOOLS, messages: [{ role: "user", content: "read the handoff" }] }),
+      }));
+      assert.strictEqual(response.status, 200);
+      if (stream) {
+        const result = await collectStreamResult(response);
+        assert.strictEqual(result.finishReason, "tool_calls");
+        assert.strictEqual(result.toolCallDeltaCount, 1);
+        assert.strictEqual(result.content, "");
+        assert.deepStrictEqual(JSON.parse(result.toolCalls[0].arguments), { path: "handoff.md" });
+      } else {
+        const result = await response.json();
+        assert.strictEqual(result.choices[0].finish_reason, "tool_calls");
+        assert.strictEqual(result.choices[0].message.tool_calls.length, 1);
+        assert.deepStrictEqual(JSON.parse(result.choices[0].message.tool_calls[0].function.arguments), { path: "handoff.md" });
+      }
+    } finally {
+      restore();
+    }
+  });
+}
+
 test("non-stream: literal <tool_call> tags are preserved when tools are absent", async () => {
   const literal =
     'Literal <tool_call>{"name":"read_file","arguments":{"path":"a.txt"}}</tool_call> text';
