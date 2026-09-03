@@ -648,6 +648,39 @@ for (const stream of [false, true]) {
   });
 }
 
+test("stream: quoted malformed opener becomes search_files", async () => {
+  const output =
+    '<tool_call"\n{"name":"search_files","arguments":{"pattern":"package.json","target":"files"}}';
+  const restore = setupFetchMock(() => createSseResponse([...output].map((content) =>
+    `data: ${JSON.stringify({ choices: [{ delta: { phase: "answer", content } }] })}`,
+  )));
+
+  try {
+    const response = await app.fetch(new Request("http://localhost/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "qwen3.6-plus",
+        stream: true,
+        tools: TOOL_SEARCH_TOOLS,
+        messages: [{ role: "user", content: "find package.json" }],
+      }),
+    }));
+    assert.strictEqual(response.status, 200);
+
+    const result = await collectStreamResult(response);
+    assert.strictEqual(result.finishReason, "tool_calls");
+    assert.strictEqual(result.content, "");
+    assert.strictEqual(result.toolCalls[0].name, "search_files");
+    assert.deepStrictEqual(JSON.parse(result.toolCalls[0].arguments), {
+      pattern: "package.json",
+      target: "files",
+    });
+  } finally {
+    restore();
+  }
+});
+
 test("stream: Qwen native control tokens become a structured tool call", async () => {
   const restore = setupFetchMock(() =>
     createSseResponse([

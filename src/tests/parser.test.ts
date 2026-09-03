@@ -316,6 +316,27 @@ test("StreamingToolParser: holds a fragmented named wrapper until it is complete
   });
 });
 
+test("StreamingToolParser: recovers a quoted malformed opener followed by complete JSON", () => {
+  const output =
+    '<tool_call"\n{"name":"search_files","arguments":{"pattern":"package.json","target":"files"}}';
+
+  for (let split = 0; split <= output.length; split++) {
+    const parser = new StreamingToolParser(TOOL_SEARCH_TOOLS);
+    const first = parser.feed(output.slice(0, split));
+    const second = parser.feed(output.slice(split));
+    const tail = parser.flush();
+    const calls = [...first.toolCalls, ...second.toolCalls, ...tail.toolCalls];
+
+    assert.strictEqual(calls.length, 1, `split ${split}`);
+    assert.strictEqual(calls[0].name, "search_files");
+    assert.deepStrictEqual(calls[0].arguments, {
+      pattern: "package.json",
+      target: "files",
+    });
+    assert.strictEqual(first.text + second.text + tail.text, "");
+  }
+});
+
 test("StreamingToolParser: parses Qwen native tool control tokens", () => {
   const parser = new StreamingToolParser(TOOLS);
   const result = parser.feed(

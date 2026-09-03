@@ -186,7 +186,7 @@ function findNextToolOpenTagOutsideMarkdownCode(
       const match = buffer
         .substring(i)
         .match(
-          /^(?:<tool>|<tool_calls>|<tool_calling>|<tool_caller>|<tool_call(?:[ \t]+[^>\r\n]*|[-_~!:|][^>\r\n]*)?(?:>|\r?\n))/i,
+          /^(?:<tool>|<tool_calls>|<tool_calling>|<tool_caller>|<tool_call(?:[ \t]+[^>\r\n]*|[-_~!:|"][^>\r\n]*)?(?:>|\r?\n))/i,
         );
       if (match) {
         return { index: i, openTag: match[0] };
@@ -444,7 +444,7 @@ function findPartialToolOpenIndexOutsideMarkdownCode(
         const suffix = tailLower.substring(lowerToolCallPrefix.length);
         if (
           suffix.length === 0 ||
-          (/^[\s_~!:|\-]/.test(suffix) && !suffix.includes(">"))
+          (/^[\s_~!:|"\-]/.test(suffix) && !suffix.includes(">"))
         ) {
           return i;
         }
