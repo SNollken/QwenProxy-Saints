@@ -430,6 +430,7 @@ interface PublicQwenModel {
 }
 
 const MODEL_CACHE_TTL_MS = 60 * 60 * 1000;
+const PUBLIC_PROVIDER_NAME = "QwenSofia";
 const modelsCache = new Map<
   string,
   { models: PublicQwenModel[]; fetchedAt: number }
@@ -975,7 +976,7 @@ function formatPublicQwenModel(
     id: noThinking ? `${model.id}-no-thinking` : model.id,
     name: noThinking ? `${model.name} (No Thinking)` : model.name,
     object: "model",
-    owned_by: model.owned_by || "qwen",
+    owned_by: PUBLIC_PROVIDER_NAME,
     created: model.info?.created_at || Date.now(),
     context_window: model.info?.meta?.max_context_length,
     capabilities: model.info?.meta?.capabilities,

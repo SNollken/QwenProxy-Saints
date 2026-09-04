@@ -50,6 +50,12 @@ test("models endpoint returns ETag and supports 304", async () => {
       ),
       "synthetic no-thinking variant should be listed",
     );
+    assert.ok(
+      body.data
+        .filter((model: any) => model.id.startsWith("qwen-test-model"))
+        .every((model: any) => model.owned_by === "QwenSofia"),
+      "all public model variants should use the QwenSofia provider name",
+    );
 
     const second = await app.fetch(
       new Request("http://localhost/v1/models", {
@@ -71,6 +77,7 @@ test("models endpoint returns a single model and 404 for missing model", async (
     assert.equal(found.status, 200);
     const model = (await found.json()) as any;
     assert.equal(model.id, "qwen-test-model");
+    assert.equal(model.owned_by, "QwenSofia");
 
     const missing = await app.fetch(
       new Request("http://localhost/v1/models/not-a-model"),
