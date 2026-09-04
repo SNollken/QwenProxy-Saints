@@ -678,6 +678,29 @@ test("StreamingToolParser: suppresses Qwen malformed attribute opener", () => {
   assert.strictEqual(flushed.truncatedToolCall, true);
 });
 
+test("StreamingToolParser: suppresses orphan invocation closers across chunks", () => {
+  const parser = new StreamingToolParser(TOOLS);
+  const first = parser.feed("</tool_call_");
+  const second = parser.feed("invocation>");
+  const third = parser.feed("</tool_call_invocation>");
+  const flushed = parser.flush();
+  const text = first.text + second.text + third.text + flushed.text;
+
+  assert.strictEqual(text, "");
+  assert.strictEqual(text.includes("tool_call_invocation"), false);
+  assert.strictEqual(second.malformedToolCall, true);
+  assert.strictEqual(third.malformedToolCall, true);
+});
+
+test("StreamingToolParser: preserves orphan-looking closers inside Markdown code", () => {
+  const parser = new StreamingToolParser(TOOLS);
+  const literal = "\`</tool_call_invocation>\`";
+  const result = parser.feed(literal);
+
+  assert.strictEqual(result.text + parser.flush().text, literal);
+  assert.strictEqual(result.malformedToolCall, undefined);
+});
+
 test("StreamingToolParser: robust parsing of malformed JSON", () => {
   const parser = new StreamingToolParser();
 

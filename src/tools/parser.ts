@@ -239,6 +239,42 @@ function findCorruptNestedToolMarkerOutsideMarkdownCode(
   return null;
 }
 
+function findOrphanToolCloseTagOutsideMarkdownCode(
+  buffer: string,
+  initialDelimiterLength = 0,
+): { index: number; marker: string } | null {
+  let delimiterLength = initialDelimiterLength;
+
+  for (let i = 0; i < buffer.length;) {
+    if (buffer[i] === "\`") {
+      let runLength = 1;
+      while (i + runLength < buffer.length && buffer[i + runLength] === "\`") {
+        runLength++;
+      }
+
+      if (delimiterLength === 0) {
+        delimiterLength = runLength;
+      } else if (runLength >= delimiterLength) {
+        delimiterLength = 0;
+      }
+
+      i += runLength;
+      continue;
+    }
+
+    if (delimiterLength === 0 && buffer[i] === "<") {
+      const match = buffer
+        .substring(i)
+        .match(/^<\/tool_call_invocation(?:[ \t]+[^>\r\n]*)?(?:>|\r?\n)/i);
+      if (match) return { index: i, marker: match[0] };
+    }
+
+    i++;
+  }
+
+  return null;
+}
+
 function findQwenNativeSectionEndOutsideMarkdownCode(
   buffer: string,
   initialDelimiterLength = 0,
@@ -425,6 +461,7 @@ function findPartialToolOpenIndexOutsideMarkdownCode(
   const lowerToolCallerStart = TOOL_CALLER_START.toLowerCase();
   const lowerCorruptOpenStart = "<tool_call<tool_call";
   const lowerCorruptCloseStart = "</tool_call<tool_call";
+  const lowerOrphanInvocationClosePrefix = "</tool_call_invocation";
 
   for (let i = 0; i < buffer.length;) {
     if (buffer[i] === "`") {
@@ -453,6 +490,20 @@ function findPartialToolOpenIndexOutsideMarkdownCode(
           !tailLower.includes(">>"))
       ) {
         return i;
+      }
+      if (lowerOrphanInvocationClosePrefix.startsWith(tailLower)) {
+        return i;
+      }
+      if (tailLower.startsWith(lowerOrphanInvocationClosePrefix)) {
+        const suffix = tailLower.substring(
+          lowerOrphanInvocationClosePrefix.length,
+        );
+        if (
+          suffix.length === 0 ||
+          (/^[ \t]/.test(suffix) && !suffix.includes(">"))
+        ) {
+          return i;
+        }
       }
       if (lowerToolStart.startsWith(tailLower)) {
         return i;
@@ -1679,6 +1730,10 @@ export class StreamingToolParser {
             this.buffer,
             this.markdownCodeDelimiterLength,
           );
+        const orphanToolClose = findOrphanToolCloseTagOutsideMarkdownCode(
+          this.buffer,
+          this.markdownCodeDelimiterLength,
+        );
         const nativeSectionEnd =
           findQwenNativeSectionEndOutsideMarkdownCode(
             this.buffer,
@@ -1704,6 +1759,24 @@ export class StreamingToolParser {
           this.buffer = "";
           this.suppressMalformedToolSyntax = true;
           break;
+        } else if (
+          orphanToolClose &&
+          (!match || orphanToolClose.index < match.index) &&
+          (!nativeSectionEnd ||
+            orphanToolClose.index <= nativeSectionEnd.index)
+        ) {
+          this.emitVisibleText(
+            result,
+            this.buffer.substring(0, orphanToolClose.index),
+          );
+          logger.warn("[parser] Suppressing orphan tool call close tag", {
+            marker: orphanToolClose.marker,
+          });
+          result.malformedToolCall = true;
+          this.buffer = this.buffer.substring(
+            orphanToolClose.index + orphanToolClose.marker.length,
+          );
+          continue;
         } else if (
           nativeSectionEnd &&
           (!match || nativeSectionEnd.index <= match.index)
