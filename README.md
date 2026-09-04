@@ -20,6 +20,7 @@ Este fork adiciona **painel web de contas**, **criação/autenticação automát
 - **Dynamic timeouts** — Timeout baseado no tamanho do payload (`120s + 30s/MB`).
 - **Payload size limit** — Validação de tamanho (10MB) antes de enviar ao Qwen.
 - **Modelos Qwen atuais** — Funciona com a família `qwen3.x` e expõe variantes sintéticas `-no-thinking`.
+- **Provider público** — O endpoint `/v1/models` identifica os modelos como `QwenSofia` no campo `owned_by`, incluindo as variantes sintéticas.
 - **Múltiplas contas** — Rotação round-robin, cooldown automático e inicialização paralela.
 - **Aplicação de gerenciamento** — Painel local (`/`) e janela desktop para listar, adicionar, autenticar, remover e acompanhar contas.
 - **Cadastro assistido** — Preenche o cadastro do Qwen, aguarda a verificação humana e incorpora a sessão confirmada ao pool.
@@ -97,6 +98,7 @@ npx playwright install chromium
 ## Modelos e contexto
 
 Os modelos e janelas de contexto são sincronizados automaticamente via `/v1/models`.
+O campo público `owned_by` usa o nome do provider `QwenSofia` para os modelos base e suas variantes.
 Valores hardcoded como fallback antes da primeira chamada à API:
 
 | Modelo | Contexto | Divisor de tokens |
