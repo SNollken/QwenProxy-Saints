@@ -14,6 +14,7 @@ import { parseRequestBody } from "./validation.ts";
 import { buildFinalContext } from "./context.ts";
 import { acquireUpstreamStream, acquireChatLock } from "./account.ts";
 import {
+  processBufferedStreamingResponse,
   processNonStreamingResponse,
   processStreamingResponse,
   handleChatCompletionsError,
@@ -438,9 +439,12 @@ export async function chatCompletions(c: Context) {
 
     while (true) {
       try {
-        return isStream
-          ? await processStreamingResponse(currentParams)
-          : await processNonStreamingResponse(currentParams);
+        if (!isStream) {
+          return await processNonStreamingResponse(currentParams);
+        }
+        return shouldParseToolCalls
+          ? await processBufferedStreamingResponse(currentParams)
+          : await processStreamingResponse(currentParams);
       } catch (streamErr: any) {
         currentStreamResult.releaseAccountSlot();
         requestSignal.throwIfAborted();

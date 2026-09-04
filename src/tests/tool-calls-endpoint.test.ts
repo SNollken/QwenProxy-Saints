@@ -1103,6 +1103,114 @@ test("stream: unclosed tool_call is recovered on flush", async () => {
   }
 });
 
+test("stream: buffers tool output and suppresses malformed text before a valid call", async () => {
+  const malformedPrefix = "<tool_call}";
+  const validCall =
+    '<tool_call>{"name":"read_file","arguments":{"path":"a.txt"}}</tool_call>';
+  const restore = setupFetchMock(() =>
+    createSseResponse([
+      `data: ${JSON.stringify({
+        choices: [
+          { delta: { phase: "answer", content: malformedPrefix } },
+        ],
+      })}`,
+      `data: ${JSON.stringify({
+        choices: [
+          {
+            delta: {
+              phase: "answer",
+              content: `${malformedPrefix}${validCall}`,
+            },
+          },
+        ],
+      })}`,
+    ]),
+  );
+
+  try {
+    const req = new Request("http://localhost/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "qwen3.6-plus",
+        stream: true,
+        tools: TOOLS,
+        messages: [{ role: "user", content: "read a file" }],
+      }),
+    });
+
+    const res = await app.fetch(req);
+    assert.strictEqual(res.status, 200);
+
+    const payload = await res.clone().text();
+    const result = await collectStreamResult(res);
+    assert.doesNotMatch(payload, /<tool_call/);
+    assert.strictEqual(result.content, "");
+    assert.strictEqual(result.toolCalls.length, 1);
+    assert.strictEqual(result.toolCalls[0].name, "read_file");
+    assert.deepStrictEqual(JSON.parse(result.toolCalls[0].arguments), {
+      path: "a.txt",
+    });
+    assert.strictEqual(result.finishReason, "tool_calls");
+  } finally {
+    restore();
+  }
+});
+
+test("stream: retries an incomplete tool call before releasing a response", async () => {
+  let attempts = 0;
+  const restore = setupFetchMock(() => {
+    attempts++;
+    if (attempts === 1) {
+      return createSseResponse([
+        `data: ${JSON.stringify({
+          choices: [{ delta: { phase: "answer", content: "<tool_call" } }],
+        })}`,
+      ]);
+    }
+    return createSseResponse([
+      `data: ${JSON.stringify({
+        choices: [
+          {
+            delta: {
+              phase: "answer",
+              content:
+                '<tool_call>{"name":"read_file","arguments":{"path":"a.txt"}}</tool_call>',
+            },
+          },
+        ],
+      })}`,
+    ]);
+  });
+
+  try {
+    const req = new Request("http://localhost/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "qwen3.6-plus",
+        stream: true,
+        tools: TOOLS,
+        messages: [{ role: "user", content: "read a file" }],
+      }),
+    });
+
+    const res = await app.fetch(req);
+    assert.strictEqual(res.status, 200);
+
+    const payload = await res.clone().text();
+    const result = await collectStreamResult(res);
+    assert.strictEqual(attempts, 2);
+    assert.doesNotMatch(payload, /<tool_call|upstream_error/);
+    assert.strictEqual(result.content, "");
+    assert.strictEqual(result.toolCalls.length, 1);
+    assert.strictEqual(result.toolCalls[0].name, "read_file");
+    assert.strictEqual(result.finishReason, "tool_calls");
+  } finally {
+    restore();
+  }
+});
+
 test("non-stream: bare tool_call marker returns a retryable upstream error", async () => {
   const restore = setupFetchMock(() =>
     createSseResponse([
@@ -1136,7 +1244,7 @@ test("non-stream: bare tool_call marker returns a retryable upstream error", asy
   }
 });
 
-test("stream: bare tool_call marker emits a retryable upstream error event", async () => {
+test("stream: bare tool_call marker retries before returning an upstream error", async () => {
   const restore = setupFetchMock(() =>
     createSseResponse([
       `data: ${JSON.stringify({
@@ -1158,13 +1266,12 @@ test("stream: bare tool_call marker emits a retryable upstream error event", asy
     });
 
     const res = await app.fetch(req);
-    assert.strictEqual(res.status, 200);
+    assert.strictEqual(res.status, 502);
 
-    const payload = await res.text();
-    assert.match(payload, /"type":"upstream_error"/);
-    assert.match(payload, /"code":"upstream_unavailable"/);
-    assert.match(payload, /could not recover an incomplete tool call/i);
-    assert.doesNotMatch(payload, /"finish_reason":"stop"/);
+    const body = await res.json();
+    assert.strictEqual(body.error.type, "upstream_error");
+    assert.strictEqual(body.error.code, "upstream_unavailable");
+    assert.match(body.error.message, /could not recover an incomplete tool call/i);
   } finally {
     restore();
   }
@@ -1195,18 +1302,12 @@ for (const stream of [false, true]) {
           messages: [{ role: "user", content: "read a file" }],
         }),
       }));
-      if (stream) {
-        assert.strictEqual(res.status, 200);
-        const payload = await res.text();
-        assert.match(payload, /"type":"upstream_error"/);
-        assert.match(payload, /could not recover an incomplete tool call/i);
-        assert.doesNotMatch(payload, /<\/?tool/);
-      } else {
-        const body = await res.json();
-        assert.strictEqual(res.status, 502);
-        assert.strictEqual(body.error.type, "upstream_error");
-        assert.match(body.error.message, /could not recover an incomplete tool call/i);
-      }
+      const payload = await res.text();
+      const body = JSON.parse(payload);
+      assert.strictEqual(res.status, 502);
+      assert.strictEqual(body.error.type, "upstream_error");
+      assert.match(body.error.message, /could not recover an incomplete tool call/i);
+      assert.doesNotMatch(payload, /<\/?tool/);
     } finally {
       restore();
     }

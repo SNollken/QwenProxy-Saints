@@ -55,6 +55,21 @@ import {
 const INCOMPLETE_TOOL_CALL_MESSAGE =
   "QwenBridge could not recover an incomplete tool call. Please retry the request.";
 
+function createRetryableIncompleteToolCallError(): RetryableQwenStreamError {
+  const error = new RetryableQwenStreamError(
+    INCOMPLETE_TOOL_CALL_MESSAGE,
+    0,
+  ) as RetryableQwenStreamError & {
+    upstreamCode?: string;
+    forceNewChat?: boolean;
+    retryWithFullPrompt?: boolean;
+  };
+  error.upstreamCode = "incomplete_tool_call";
+  error.forceNewChat = true;
+  error.retryWithFullPrompt = true;
+  return error;
+}
+
 function firstString(...values: unknown[]): string | null {
   for (const value of values) {
     if (typeof value === "string" && value.trim()) return value;
@@ -580,10 +595,7 @@ export async function processNonStreamingResponse(
       finalContent.trim().length === 0 &&
       upstreamFinishReason !== "length"
     ) {
-      return sendOpenAIError(
-        c,
-        createError(502, INCOMPLETE_TOOL_CALL_MESSAGE),
-      );
+      throw createRetryableIncompleteToolCallError();
     }
 
     if (isToolcallDebugEnabled()) {
@@ -649,7 +661,7 @@ export async function processNonStreamingResponse(
       responseId: targetResponseId,
       userPrompt,
       finalPrompt,
-      assistantContent: finalContent,
+      assistantContent: toolCallsOut.length ? "" : finalContent,
       reasoningContent: reasoningBuffer || undefined,
       usage,
       finishReason,
@@ -675,6 +687,118 @@ export async function processNonStreamingResponse(
       logger.debug("[chat] non-stream: cleanup", { completionId });
     }
     removeStream(completionId);
+    if (onStreamComplete) onStreamComplete();
+  }
+}
+
+export async function processBufferedStreamingResponse(
+  params: StreamProcessingParams,
+): Promise<Response> {
+  const { c, completionId, body, onStreamComplete } = params;
+  const bufferedResponse = await processNonStreamingResponse({
+    ...params,
+    onStreamComplete: undefined,
+  });
+
+  try {
+    if (!bufferedResponse.ok) return bufferedResponse;
+
+    const completion = (await bufferedResponse.json()) as {
+      choices?: Array<{
+        message?: {
+          content?: string | null;
+          reasoning_content?: string;
+          tool_calls?: Array<{
+            id: string;
+            type: "function";
+            function: { name: string; arguments: string };
+          }>;
+        };
+        finish_reason?: string | null;
+      }>;
+      usage?: Usage;
+    };
+    const choice = completion.choices?.[0];
+    const message = choice?.message;
+    const created = Math.floor(Date.now() / 1000);
+    const events: string[] = [];
+    const pushEvent = (delta: Record<string, unknown>, finishReason: string | null = null) => {
+      events.push(
+        `data: ${JSON.stringify({
+          id: completionId,
+          object: "chat.completion.chunk",
+          created,
+          model: body.model,
+          choices: [
+            {
+              index: 0,
+              delta,
+              logprobs: null,
+              finish_reason: finishReason,
+            },
+          ],
+        })}\n\n`,
+      );
+    };
+
+    pushEvent({ role: "assistant", content: "" });
+    if (message?.reasoning_content) {
+      pushEvent({ reasoning_content: message.reasoning_content });
+    }
+    if (message?.content) {
+      pushEvent({ content: message.content });
+    }
+    for (const [index, toolCall] of (message?.tool_calls ?? []).entries()) {
+      pushEvent({
+        tool_calls: [
+          {
+            index,
+            id: toolCall.id,
+            type: toolCall.type,
+            function: toolCall.function,
+          },
+        ],
+      });
+    }
+
+    events.push(
+      `data: ${JSON.stringify({
+        id: completionId,
+        object: "chat.completion.chunk",
+        created,
+        model: body.model,
+        choices: [
+          {
+            index: 0,
+            delta: {},
+            logprobs: null,
+            finish_reason: choice?.finish_reason ?? "stop",
+          },
+        ],
+        ...(body.stream_options?.include_usage
+          ? {}
+          : { usage: completion.usage }),
+      })}\n\n`,
+    );
+    if (body.stream_options?.include_usage) {
+      events.push(
+        `data: ${JSON.stringify({
+          id: completionId,
+          object: "chat.completion.chunk",
+          created,
+          model: body.model,
+          choices: [],
+          usage: completion.usage,
+        })}\n\n`,
+      );
+    }
+    events.push("data: [DONE]\n\n");
+
+    c.header("Content-Type", "text/event-stream");
+    c.header("Cache-Control", "no-cache");
+    c.header("Connection", "keep-alive");
+    return c.body(events.join(""));
+  } finally {
     if (onStreamComplete) onStreamComplete();
   }
 }
@@ -1491,16 +1615,7 @@ export async function processStreamingResponse(
         finalContent.trim().length === 0 &&
         upstreamFinishReason !== "length"
       ) {
-        const errorPayload = createError(
-          502,
-          INCOMPLETE_TOOL_CALL_MESSAGE,
-        ).toOpenAI();
-        const bufferedPayload = flushBuffer?.join("") ?? "";
-        await streamWriter.write(
-          `${bufferedPayload}data: ${JSON.stringify(errorPayload)}\n\ndata: [DONE]\n\n`,
-        );
-        flushBuffer = null;
-        return;
+        throw createRetryableIncompleteToolCallError();
       }
 
       // Finish reason + usage + [DONE]
@@ -1668,5 +1783,5 @@ export function handleChatCompletionsError(c: Context, err: unknown): Response {
   const status = classified.statusCode;
   console.error(`❌ [Chat] Error | ${status} ${code} | ${message}`);
 
-  return sendOpenAIError(c, err);
+  return sendOpenAIError(c, classified);
 }
