@@ -667,6 +667,17 @@ test("StreamingToolParser: flush partial content", () => {
   assert.strictEqual(flushed2.truncatedToolCall, true);
 });
 
+test("StreamingToolParser: suppresses Qwen malformed attribute opener", () => {
+  const parser = new StreamingToolParser(TOOLS);
+  const first = parser.feed("The handoff is pending.\n\n<tool_call=");
+  const second = parser.feed('"tool_call">');
+  const flushed = parser.flush();
+
+  assert.strictEqual(first.text + second.text + flushed.text, "The handoff is pending.\n\n");
+  assert.strictEqual(flushed.toolCalls.length, 0);
+  assert.strictEqual(flushed.truncatedToolCall, true);
+});
+
 test("StreamingToolParser: robust parsing of malformed JSON", () => {
   const parser = new StreamingToolParser();
 
