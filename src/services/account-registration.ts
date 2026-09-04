@@ -558,6 +558,45 @@ async function handleCaptcha(
   );
 }
 
+export async function acceptRegistrationTerms(page: Page): Promise<void> {
+  const checkbox = page
+    .locator(
+      '[role="checkbox"].qwenchat-auth-pc-register-policy-checkbox, .qwenchat-auth-pc-register-policy [role="checkbox"], input.ant-checkbox-input, input[type="checkbox"]',
+    )
+    .first();
+
+  if (await checkbox.count()) {
+    const role = await checkbox.getAttribute("role");
+    const checked =
+      role === "checkbox"
+        ? (await checkbox.getAttribute("aria-checked")) === "true"
+        : await checkbox.isChecked().catch(() => false);
+
+    if (!checked) {
+      await checkbox.click({ timeout: 5_000 });
+    }
+
+    const accepted =
+      role === "checkbox"
+        ? (await checkbox.getAttribute("aria-checked")) === "true"
+        : await checkbox.isChecked().catch(() => false);
+    if (!accepted) {
+      throw new Error("Não foi possível aceitar os termos do cadastro do Qwen.");
+    }
+    return;
+  }
+
+  const clicked = await clickByText(page, [
+    "Estou de acordo",
+    "I agree",
+    "Termos de uso",
+    "concordo",
+  ]);
+  if (!clicked) {
+    throw new Error("Aceite dos termos não encontrado no formulário do Qwen.");
+  }
+}
+
 /**
  * Real Qwen Studio auth form (2026):
  * Login: input[name=email] type=text, input[name=password], "Inscrever-se"
@@ -630,24 +669,7 @@ async function openSignupAndFill(
     await fillByName(page, "username", displayName).catch(() => {});
   }
 
-  // Accept terms checkbox (required — submit stays disabled otherwise)
-  const checkbox = page.locator('input.ant-checkbox-input, input[type="checkbox"]').first();
-  if (await checkbox.count()) {
-    const checked = await checkbox.isChecked().catch(() => false);
-    if (!checked) {
-      // click label/wrapper because antd often intercepts
-      await page.locator(".ant-checkbox, .ant-checkbox-wrapper").first().click().catch(async () => {
-        await checkbox.check({ force: true }).catch(() => {});
-      });
-    }
-  } else {
-    await clickByText(page, [
-      "Estou de acordo",
-      "I agree",
-      "Termos de uso",
-      "concordo",
-    ]);
-  }
+  await acceptRegistrationTerms(page);
 
   await sleep(400);
 
@@ -655,6 +677,9 @@ async function openSignupAndFill(
   const submit = page.locator(
     'button[type="submit"], button:has-text("Criar Conta"), button:has-text("Create Account"), button:has-text("Sign up")',
   ).first();
+  if (await submit.isDisabled().catch(() => false)) {
+    throw new Error("O formulário de inscrição continua desabilitado após aceitar os termos.");
+  }
   await submit.click({ timeout: 10_000 }).catch(async () => {
     await clickByText(page, ["Criar Conta", "Create Account", "Sign up"]);
   });

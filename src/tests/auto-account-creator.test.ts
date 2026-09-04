@@ -1,5 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert";
+import { chromium } from "playwright";
 import { getDatabase } from "../core/database.ts";
 import { invalidateAccountsCache } from "../core/accounts.ts";
 import {
@@ -93,4 +94,40 @@ test("AutoCreator: status exposes config flags", () => {
   assert.strictEqual(typeof status.busy, "boolean");
   assert.strictEqual(typeof status.message, "string");
   assert.ok(status.cooldownRemainingMs >= 0);
+});
+
+test("AutoCreator: accepts the Qwen role checkbox used by the signup form", async () => {
+  const browser = await chromium.launch({ headless: true });
+  try {
+    const page = await browser.newPage();
+    await page.setContent(`
+      <div class="qwenchat-auth-pc-register-policy">
+        <span role="checkbox" aria-checked="false" tabindex="0">
+          <span>Estou de acordo com</span>
+        </span>
+      </div>
+      <button type="submit" disabled>Criar Conta</button>
+      <script>
+        const checkbox = document.querySelector('[role="checkbox"]');
+        const button = document.querySelector('button[type="submit"]');
+        checkbox.addEventListener('click', () => {
+          checkbox.setAttribute('aria-checked', 'true');
+          button.disabled = false;
+        });
+      </script>
+    `);
+
+    const { acceptRegistrationTerms } = await import(
+      "../services/account-registration.ts"
+    );
+    await acceptRegistrationTerms(page);
+
+    assert.equal(
+      await page.locator('[role="checkbox"]').getAttribute("aria-checked"),
+      "true",
+    );
+    assert.equal(await page.locator('button[type="submit"]').isDisabled(), false);
+  } finally {
+    await browser.close();
+  }
 });
