@@ -52,6 +52,10 @@ const TOOL_CALLER_START = "<tool_caller>";
 const TOOL_CALLER_END = "</tool_caller>";
 const QWEN_NATIVE_TOOL_BEGIN = "<tool_call_begin|>";
 const QWEN_NATIVE_ARGUMENT_BEGIN = "<|tool_call_argument_begin|>";
+const QWEN_NATIVE_TOOL_END_TAGS = [
+  "</tool_call_end|>",
+  "<tool_call_end|>",
+];
 const QWEN_NATIVE_SECTION_END_TAGS = [
   "</tool_calls_section_end|>",
   "<tool_calls_section_end|>",
@@ -336,6 +340,28 @@ function findToolCloseTag(
   buffer: string,
   openTag: string,
 ): { index: number; length: number } | null {
+  if (openTag.toLowerCase() === QWEN_NATIVE_TOOL_BEGIN.toLowerCase()) {
+    let inString = false;
+    let escaped = false;
+    const lowerBuffer = buffer.toLowerCase();
+    for (let i = 0; i < buffer.length; i++) {
+      const char = buffer[i];
+      if (escaped) {
+        escaped = false;
+      } else if (inString && char === "\\") {
+        escaped = true;
+      } else if (char === '"') {
+        inString = !inString;
+      } else if (!inString) {
+        const tag = QWEN_NATIVE_TOOL_END_TAGS.find((candidate) =>
+          lowerBuffer.startsWith(candidate, i)
+        );
+        if (tag) return { index: i, length: tag.length };
+      }
+    }
+    return null;
+  }
+
   if (/^<(?:tool|tool_calls|tool_call_calls)>$/i.test(openTag)) {
     const grouped = openTag.toLowerCase() !== "<tool>";
     const tags = /<parameter\b[^>]*>|<\/(?:tool_calls|tool_call_calls|tool|invoke)>/gi;
@@ -1307,7 +1333,41 @@ export class StreamingToolParser {
     const argumentMarkerIndex = nativeContent
       .toLowerCase()
       .indexOf(QWEN_NATIVE_ARGUMENT_BEGIN.toLowerCase());
-    if (argumentMarkerIndex <= 0) return null;
+    if (argumentMarkerIndex <= 0) {
+      const envelope = parseJsonishString(nativeContent);
+      if (!envelope || typeof envelope !== "object" || Array.isArray(envelope)) {
+        return null;
+      }
+      const nativeEnvelope = envelope as Record<string, unknown>;
+      const emittedName = [
+        nativeEnvelope.tool_name,
+        nativeEnvelope.name,
+        nativeEnvelope.tool,
+      ].find((value): value is string => typeof value === "string");
+      const toolName = emittedName
+        ? this.resolveDeclaredToolName(emittedName)
+        : null;
+      let parsedArguments = nativeEnvelope.arguments ?? nativeEnvelope.args;
+      if (typeof parsedArguments === "string") {
+        parsedArguments = parseJsonishString(parsedArguments);
+      }
+      if (
+        !toolName ||
+        !parsedArguments ||
+        typeof parsedArguments !== "object" ||
+        Array.isArray(parsedArguments)
+      ) {
+        return null;
+      }
+      return {
+        id: `call_${crypto.randomUUID()}`,
+        name: toolName,
+        arguments: this.normalizeArgumentsForTool(
+          toolName,
+          parsedArguments as Record<string, unknown>,
+        ),
+      };
+    }
 
     const emittedName = nativeContent
       .substring(0, argumentMarkerIndex)

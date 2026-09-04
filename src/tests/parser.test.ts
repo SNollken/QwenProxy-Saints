@@ -415,6 +415,28 @@ test("StreamingToolParser: handles multiple native calls and the unslashed secti
   assert.strictEqual(parser.flush().truncatedToolCall, false);
 });
 
+test("StreamingToolParser: parses native JSON envelopes observed from Qwen", () => {
+  const parser = new StreamingToolParser([...TOOLS, ...TERMINAL_TOOLS]);
+  const result = parser.feed(
+    '<tool_call_begin|>{"arguments":{"path":"package.json"},"tool_name":"read_file"}<tool_call_end|>' +
+      '<tool_call_begin|>{"arguments":{"command":"echo QWEN_BUFFER"},"tool_name":"terminal"}<tool_call_end|>' +
+      '<tool_calls_section_end|>',
+  );
+  const flushed = parser.flush();
+
+  assert.strictEqual(result.text + flushed.text, "");
+  assert.deepStrictEqual(
+    [...result.toolCalls, ...flushed.toolCalls].map((call) => [
+      call.name,
+      call.arguments,
+    ]),
+    [
+      ["read_file", { path: "package.json" }],
+      ["terminal", { command: "echo QWEN_BUFFER" }],
+    ],
+  );
+});
+
 test("StreamingToolParser: never invokes undeclared Qwen native tools", () => {
   const parser = new StreamingToolParser(TOOLS);
   const result = parser.feed(
